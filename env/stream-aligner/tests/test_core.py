@@ -5,7 +5,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "services", "aligner"))
 
-from app.core import compute_payload, decide, effective, payload_hash, window_of  # noqa: E402
+from app.core import (compute_payload, decide, delivery_kind, effective,  # noqa: E402
+                      payload_hash, retry_delay_ms, window_of)
 
 W = 30_000
 
@@ -106,6 +107,34 @@ class TestDecide(unittest.TestCase):
         p = compute_payload("k", 0, W, [ev("a9", 1)], [])
         d = decide(head, p)
         self.assertEqual((d["version"], d["status"]), (3, "CURRENT"))
+
+
+class TestDeliveryKind(unittest.TestCase):
+    def test_first_version_is_new(self):
+        self.assertEqual(delivery_kind("INITIAL", "CURRENT"), "NEW")
+
+    def test_late_event_and_partial_retraction_are_corrections(self):
+        self.assertEqual(delivery_kind("LATE_EVENT", "CURRENT"), "CORRECTION")
+        self.assertEqual(delivery_kind("RETRACTION", "CURRENT"), "CORRECTION")
+
+    def test_emptied_result_is_withdrawal(self):
+        self.assertEqual(delivery_kind("RETRACTION", "RETRACTED"), "WITHDRAWAL")
+        self.assertEqual(delivery_kind("LATE_EVENT", "RETRACTED"), "WITHDRAWAL")
+
+    def test_revival_after_withdrawal_is_correction_not_new(self):
+        # a result coming back after being withdrawn must amend, not double-book
+        self.assertEqual(delivery_kind("LATE_EVENT", "CURRENT"), "CORRECTION")
+
+
+class TestRetryDelay(unittest.TestCase):
+    def test_exponential_backoff(self):
+        self.assertEqual(retry_delay_ms(1, 1000, 60000), 1000)
+        self.assertEqual(retry_delay_ms(2, 1000, 60000), 2000)
+        self.assertEqual(retry_delay_ms(3, 1000, 60000), 4000)
+
+    def test_capped_at_max(self):
+        self.assertEqual(retry_delay_ms(100, 1000, 60000), 60000)
+        self.assertEqual(retry_delay_ms(1, 5000, 3000), 3000)
 
 
 if __name__ == "__main__":

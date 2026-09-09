@@ -64,6 +64,13 @@ services:
       INGEST_B_URL: http://ingest-b:8000
       WINDOW_SIZE_MS: "30000"
       POLL_INTERVAL_MS: "1000"
+      DELIVERY_POLL_MS: "500"
+      DELIVERY_RETRY_BASE_MS: "2000"
+      DELIVERY_RETRY_MAX_MS: "10000"
+    # lets subscriber URLs point at a receiver running on the docker host
+    # (http://host.docker.internal:PORT/...) on Linux as well as Mac/Windows
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       ingest-a:
         condition: service_started

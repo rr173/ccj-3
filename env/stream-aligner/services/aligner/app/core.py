@@ -69,6 +69,25 @@ def payload_hash(payload):
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def delivery_kind(reason, status):
+    """Classify a result version for downstream delivery.
+
+    NEW        — first version of a result (downstream books it);
+    CORRECTION — a later live version (downstream *amends* the existing
+                 booking under the same (window_start, key) identity — it
+                 must never be booked as another new success);
+    WITHDRAWAL — the result became empty (downstream reverses the booking).
+    """
+    if status == "RETRACTED":
+        return "WITHDRAWAL"
+    return "NEW" if reason == "INITIAL" else "CORRECTION"
+
+
+def retry_delay_ms(attempts, base_ms, max_ms):
+    """Exponential backoff after ``attempts`` failed attempts (attempts >= 1)."""
+    return min(base_ms * (2 ** (attempts - 1)), max_ms)
+
+
 def decide(head, new_payload):
     """Decide the next version given the current head row and a recomputed payload.
 

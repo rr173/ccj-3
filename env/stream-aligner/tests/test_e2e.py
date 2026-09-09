@@ -5,21 +5,59 @@ Usage:  docker compose up -d --build && python3 tests/test_e2e.py
 
 Covers the required behaviours: dual-watermark gating, duplicates, in-window
 disorder, late-event correction, retraction, idle streams, watermark
-regression, idempotent recompute, and the audit trail.
+regression, idempotent recompute, the audit trail — and downstream delivery:
+subscription registration, in-order push of every version (NEW / CORRECTION /
+WITHDRAWAL), retry-with-backoff on receiver failure, and the delivery-status
+query APIs.
 """
 import json
 import os
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 A = os.environ.get("INGEST_A_URL", "http://localhost:8001")
 B = os.environ.get("INGEST_B_URL", "http://localhost:8002")
 R = os.environ.get("ALIGNER_URL", "http://localhost:8003")
 WINDOW_MS = int(os.environ.get("WINDOW_SIZE_MS", "30000"))
 
+# Receiver for downstream deliveries. Runs in-process; the aligner reaches it
+# via RECEIVER_BASE_URL (host.docker.internal works with the compose stack).
+RECV_PORT = int(os.environ.get("RECEIVER_PORT", "8901"))
+RECV_BASE = os.environ.get("RECEIVER_BASE_URL", f"http://host.docker.internal:{RECV_PORT}")
+
 FAILED = []
+DELIVERIES = []          # every 200-acked delivery the receiver has seen, in arrival order
+FLAKY = {"fail_next": 0}  # /flaky endpoint fails this many next requests with 500
+LOCK = threading.Lock()
+
+
+class Receiver(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(n) or b"{}")
+        sub = "flaky" if self.path.startswith("/flaky") else "good"
+        with LOCK:
+            if sub == "flaky" and FLAKY["fail_next"] > 0:
+                FLAKY["fail_next"] -= 1
+                code = 500
+            else:
+                code = 200
+            if code == 200:
+                DELIVERIES.append(dict(body, _sub=sub))
+        self.send_response(code)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def recv(sub, key):
+    with LOCK:
+        return [d for d in DELIVERIES if d["_sub"] == sub and d.get("key") == key]
 
 
 def check(name, cond, detail=""):
@@ -76,6 +114,15 @@ def main():
     push = ws + WINDOW_MS + 8000  # beyond window end + 5s grace
     key = f"e2e-{now}"
 
+    # -- downstream receivers + subscription registration --------------------
+    server = ThreadingHTTPServer(("0.0.0.0", RECV_PORT), Receiver)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    r = post(R, "/subscriptions", {"name": "e2e-good", "url": f"{RECV_BASE}/good"})
+    check("register downstream subscriber", r["subscription"]["active"] is True)
+    r = post(R, "/subscriptions", {"name": "e2e-flaky", "url": f"{RECV_BASE}/flaky"})
+    check("register second subscriber", r["subscription"]["name"] == "e2e-flaky")
+    FLAKY["fail_next"] = 3  # first 3 delivery attempts to /flaky will fail
+
     # -- duplicates & in-window disorder ------------------------------------
     r = post(A, "/events", {"events": [
         ev(f"{key}-a2", ws + 2000, key, payload={"n": 2}),
@@ -105,6 +152,12 @@ def main():
         pairs = [(p["a_event_id"], p["b_event_id"]) for p in v1["payload"]["pairs"]]
         check("pairs aligned in event-time order",
               pairs == [(f"{key}-a1", f"{key}-b1"), (f"{key}-a2", f"{key}-b2")], str(pairs))
+
+    # -- failed delivery is visible as RETRYING, never dropped ---------------
+    wait_for("failed delivery visible as RETRYING",
+             lambda: get(R, "/deliveries", window_start=ws, key=key,
+                         subscriber="e2e-flaky", status="RETRYING")["deliveries"] or None,
+             timeout=30)
 
     # -- duplicate replay through the aligner must not double count ----------
     post(A, "/events", {"events": [ev(f"{key}-a1", ws + 1000, key, payload={"n": 1}),
@@ -177,6 +230,62 @@ def main():
                   lambda: (h := head(ws, key2)) and h["status"] == "RETRACTED" and h)
     if vr:
         check("retracted result has null payload", vr["payload"] is None)
+
+    # -- downstream delivery: order, kinds, retry, status queries ------------
+    def versions_of(sub, k):
+        return [d["version"] for d in recv(sub, k)]
+
+    def kinds_of(sub, k):
+        seen = {}
+        for d in recv(sub, k):  # first occurrence per version
+            seen.setdefault(d["version"], d["kind"])
+        return [seen[v] for v in sorted(seen)]
+
+    wait_for("good subscriber received every version of key",
+             lambda: len(set(versions_of("good", key))) >= 4, timeout=60)
+    wait_for("good subscriber received every version of key2",
+             lambda: len(set(versions_of("good", key2))) >= 2, timeout=60)
+    wait_for("flaky subscriber eventually received everything (retries)",
+             lambda: len(set(versions_of("flaky", key))) >= 4
+             and len(set(versions_of("flaky", key2))) >= 2, timeout=60)
+
+    vs = versions_of("good", key)
+    check("deliveries arrive in version order per result",
+          vs == sorted(vs) and set(vs) == {1, 2, 3, 4}, str(vs))
+    check("kinds: one NEW then CORRECTIONs (correction is not a new success)",
+          kinds_of("good", key) == ["NEW", "CORRECTION", "CORRECTION", "CORRECTION"],
+          str(kinds_of("good", key)))
+    check("all versions carry the same result identity",
+          all(d["window_start"] == ws and d["key"] == key for d in recv("good", key)))
+    check("withdrawal of key2 delivered as WITHDRAWAL with null payload",
+          kinds_of("good", key2) == ["NEW", "WITHDRAWAL"]
+          and recv("good", key2)[-1]["payload"] is None)
+    check("every delivery carries a dedup id and emitted_at",
+          all(d.get("delivery_id") and d.get("emitted_at") for d in recv("good", key)))
+    check("flaky subscriber also got versions in order",
+          versions_of("flaky", key) == sorted(versions_of("flaky", key)))
+
+    rows = get(R, "/deliveries", window_start=ws, key=key)["deliveries"]
+    flaky_v1 = [r for r in rows if r["subscriber"] == "e2e-flaky" and r["version"] == 1]
+    check("retried delivery eventually DELIVERED with attempts > 1",
+          bool(flaky_v1) and flaky_v1[0]["status"] == "DELIVERED"
+          and flaky_v1[0]["attempts"] >= 4 and flaky_v1[0]["last_error"] is None,
+          str(flaky_v1))
+
+    st = get(R, "/results/delivery", window_start=ws, key=key)
+    ups = {s["subscriber"]: s["delivered_up_to"] for s in st["subscribers"]}
+    check("per-result delivery status: delivered_up_to == head version",
+          ups.get("e2e-good") == 4 and ups.get("e2e-flaky") == 4, str(ups))
+    st2 = get(R, "/results/delivery", window_start=ws, key=key2)
+    ups2 = {s["subscriber"]: s["delivered_up_to"] for s in st2["subscribers"]}
+    check("withdrawn result fully delivered too",
+          ups2.get("e2e-good") == 2 and ups2.get("e2e-flaky") == 2, str(ups2))
+
+    subs = {s["name"]: s for s in get(R, "/subscriptions")["subscriptions"]}
+    check("subscription list shows backlog counters, nothing left retrying",
+          subs.get("e2e-good", {}).get("retrying") == 0
+          and subs.get("e2e-flaky", {}).get("retrying") == 0
+          and subs.get("e2e-good", {}).get("delivered", 0) > 0, str(subs))
 
     print()
     if FAILED:

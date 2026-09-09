@@ -6,7 +6,15 @@ passed the window end. Late events and retractions recompute already-emitted
 windows and produce new, fully audited versions — old versions are kept, never
 overwritten. All recomputation is idempotent: identical content never yields a
 new version, so replays and restarts cannot double-count.
+
+Every emitted version is also fanned out to registered downstreams via a
+transactional outbox: the delivery rows are inserted in the same transaction
+as the result version, so a version can never exist without its deliveries.
+A dispatcher pushes deliveries to each subscriber in per-result version order
+(a later version is never sent before an earlier one), retries failures with
+exponential backoff, and never gives up — nothing is silently dropped.
 """
+import json
 import logging
 import os
 import threading
@@ -18,9 +26,10 @@ from typing import Optional
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 
-from app.core import compute_payload, decide, window_of
+from app.core import compute_payload, decide, delivery_kind, retry_delay_ms, window_of
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -34,6 +43,11 @@ INGESTS = {
 WINDOW_MS = int(os.environ.get("WINDOW_SIZE_MS", "60000"))
 POLL_MS = int(os.environ.get("POLL_INTERVAL_MS", "1000"))
 BATCH = int(os.environ.get("PULL_BATCH_SIZE", "500"))
+DELIVERY_POLL_MS = int(os.environ.get("DELIVERY_POLL_MS", "1000"))
+DELIVERY_TIMEOUT_MS = int(os.environ.get("DELIVERY_TIMEOUT_MS", "5000"))
+RETRY_BASE_MS = int(os.environ.get("DELIVERY_RETRY_BASE_MS", "2000"))
+RETRY_MAX_MS = int(os.environ.get("DELIVERY_RETRY_MAX_MS", "60000"))
+DISPATCH_BATCH = int(os.environ.get("DELIVERY_DISPATCH_BATCH", "100"))
 
 DDL = """
 CREATE TABLE IF NOT EXISTS stream_events (
@@ -90,6 +104,38 @@ CREATE TABLE IF NOT EXISTS audit (
     detail       JSONB,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Delivery outbox. One row per (subscriber, result version); rows are created
+-- in the same transaction as the result version itself, so an emitted version
+-- can never be missing its deliveries. The dispatcher only ever *updates*
+-- these rows, so a crash mid-delivery is recovered by simply retrying.
+CREATE TABLE IF NOT EXISTS subscribers (
+    id         BIGSERIAL PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    url        TEXT NOT NULL,
+    active     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS deliveries (
+    id              BIGSERIAL PRIMARY KEY,
+    subscriber_id   BIGINT NOT NULL REFERENCES subscribers(id),
+    window_start    BIGINT NOT NULL,
+    window_end      BIGINT NOT NULL,
+    key             TEXT NOT NULL,
+    version         INT NOT NULL,
+    kind            TEXT NOT NULL CHECK (kind IN ('NEW', 'CORRECTION', 'WITHDRAWAL')),
+    payload         JSONB,           -- result snapshot as of this version
+    status          TEXT NOT NULL DEFAULT 'PENDING'
+                    CHECK (status IN ('PENDING', 'RETRYING', 'DELIVERED')),
+    attempts        INT NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_attempt_at TIMESTAMPTZ,
+    delivered_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (subscriber_id, window_start, key, version)
+);
+CREATE INDEX IF NOT EXISTS deliveries_due_idx
+    ON deliveries (next_attempt_at) WHERE status <> 'DELIVERED';
 """
 
 
@@ -107,8 +153,16 @@ def http_get(url, params=None, timeout=10):
     if params:
         url += "?" + urllib.parse.urlencode(params)
     with urllib.request.urlopen(url, timeout=timeout) as resp:
-        import json
         return json.loads(resp.read())
+
+
+def http_post(url, body, timeout=5):
+    """POST a JSON body; raises unless the endpoint answers 2xx."""
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        resp.read()
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +206,12 @@ def build_payload(cur, window_start, key):
 
 
 def emit(conn, window_start, key, reason, detail):
-    """Recompute (window, key) and persist a new version iff the content changed."""
+    """Recompute (window, key) and persist a new version iff the content changed.
+
+    The version row, its audit entry and one outbox delivery per subscriber
+    are written in a single transaction: a version never exists without its
+    audit trail, and never without the deliveries that push it downstream.
+    """
     window_end = window_start + WINDOW_MS
     with conn, conn.cursor() as cur:
         payload = build_payload(cur, window_start, key)
@@ -176,6 +235,18 @@ def emit(conn, window_start, key, reason, detail):
             (window_start, window_end, key,
              head["version"] if head else None, nxt["version"], reason,
              psycopg2.extras.Json(detail) if detail is not None else None),
+        )
+        # Outbox fan-out. kind tells the downstream how to book this version:
+        # NEW = first sight of the result, CORRECTION = amend the same
+        # (window, key) booking (never a new success), WITHDRAWAL = reverse it.
+        kind = delivery_kind(reason, nxt["status"])
+        cur.execute(
+            """INSERT INTO deliveries (subscriber_id, window_start, window_end, key,
+                                       version, kind, payload)
+               SELECT s.id, %s, %s, %s, %s, %s, %s FROM subscribers s
+               ON CONFLICT (subscriber_id, window_start, key, version) DO NOTHING""",
+            (window_start, window_end, key, nxt["version"], kind,
+             psycopg2.extras.Json(payload) if payload is not None else None),
         )
     log.info("window=%d key=%s -> v%d (%s, %s)", window_start, key, nxt["version"],
              nxt["status"], reason)
@@ -312,6 +383,117 @@ def tick(conn):
 
 
 # ---------------------------------------------------------------------------
+# delivery dispatcher (transactional outbox)
+# ---------------------------------------------------------------------------
+
+# A delivery is due only when every earlier version of the *same result* for
+# the *same subscriber* is DELIVERED — version N+1 must never reach a
+# downstream before version N. Different results proceed independently.
+DUE_SQL = """
+SELECT d.id, d.subscriber_id, s.name AS subscriber, s.url,
+       d.window_start, d.window_end, d.key, d.version, d.kind, d.payload,
+       d.attempts, d.created_at
+FROM deliveries d
+JOIN subscribers s ON s.id = d.subscriber_id
+WHERE s.active
+  AND d.status IN ('PENDING', 'RETRYING')
+  AND d.next_attempt_at <= now()
+  AND NOT EXISTS (
+      SELECT 1 FROM deliveries p
+      WHERE p.subscriber_id = d.subscriber_id
+        AND p.window_start = d.window_start
+        AND p.key = d.key
+        AND p.version < d.version
+        AND p.status <> 'DELIVERED'
+  )
+ORDER BY d.id
+LIMIT %s
+"""
+
+
+def deliver_one(conn, row):
+    """Attempt one delivery; record the outcome on the outbox row.
+
+    At-least-once by design: a lost response after a successful receive yields
+    a duplicate, which the downstream dedups by delivery_id / version. A
+    failure only ever schedules another attempt — rows are never deleted, so
+    nothing is dropped.
+    """
+    envelope = {
+        "delivery_id": row["id"],
+        "kind": row["kind"],
+        "window_start": row["window_start"],
+        "window_end": row["window_end"],
+        "key": row["key"],
+        "version": row["version"],
+        "payload": row["payload"],
+        "emitted_at": row["created_at"].isoformat() if row["created_at"] else None,
+    }
+    attempts = row["attempts"] + 1
+    try:
+        http_post(row["url"], envelope, timeout=DELIVERY_TIMEOUT_MS / 1000.0)
+    except Exception as exc:
+        delay = retry_delay_ms(attempts, RETRY_BASE_MS, RETRY_MAX_MS)
+        err = f"{type(exc).__name__}: {exc}"[:500]
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE deliveries
+                   SET status = 'RETRYING', attempts = %s, last_attempt_at = now(),
+                       next_attempt_at = now() + %s * INTERVAL '1 millisecond',
+                       last_error = %s
+                   WHERE id = %s""",
+                (attempts, delay, err, row["id"]),
+            )
+        log.warning("delivery %d (%s %s v%d) to %s failed (%s); retry %d in %dms",
+                    row["id"], row["kind"], row["key"], row["version"],
+                    row["subscriber"], err, attempts, delay)
+        return False
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            """UPDATE deliveries
+               SET status = 'DELIVERED', attempts = %s, last_attempt_at = now(),
+                   delivered_at = now(), last_error = NULL
+               WHERE id = %s""",
+            (attempts, row["id"]),
+        )
+    log.info("delivery %d (%s %s v%d) to %s ok (attempt %d)",
+             row["id"], row["kind"], row["key"], row["version"],
+             row["subscriber"], attempts)
+    return True
+
+
+def dispatch_due(conn):
+    """Deliver everything currently due, draining version chains in one pass."""
+    for _ in range(20):  # a success may make the next version eligible
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(DUE_SQL, (DISPATCH_BATCH,))
+            rows = cur.fetchall()
+        if not rows:
+            return
+        progressed = False
+        for row in rows:
+            if deliver_one(conn, row):
+                progressed = True
+        if not progressed:
+            return
+
+
+def delivery_loop():
+    log.info("delivery dispatcher started (poll=%dms timeout=%dms backoff=%d..%dms)",
+             DELIVERY_POLL_MS, DELIVERY_TIMEOUT_MS, RETRY_BASE_MS, RETRY_MAX_MS)
+    while not _stop.is_set():
+        try:
+            conn = connect()
+            try:
+                dispatch_due(conn)
+            finally:
+                conn.close()
+        except Exception:
+            log.exception("dispatch failed; will retry")
+        _stop.wait(DELIVERY_POLL_MS / 1000.0)
+
+
+# ---------------------------------------------------------------------------
 # service plumbing
 # ---------------------------------------------------------------------------
 
@@ -340,9 +522,12 @@ async def lifespan(app):
     conn.close()
     t = threading.Thread(target=loop, daemon=True)
     t.start()
+    d = threading.Thread(target=delivery_loop, daemon=True)
+    d.start()
     yield
     _stop.set()
     t.join(timeout=5)
+    d.join(timeout=5)
 
 
 app = FastAPI(title="aligner", lifespan=lifespan)
@@ -503,3 +688,159 @@ def windows():
             "head_status": head["status"] if head else None,
         })
     return {"windows": out, "min_watermark": min_wm}
+
+
+# ---------------------------------------------------------------------------
+# downstream subscriptions & delivery status
+# ---------------------------------------------------------------------------
+
+class SubscriptionIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    url: str = Field(min_length=1, max_length=2000,
+                     description="endpoint that receives POSTed result versions")
+
+
+@app.post("/subscriptions")
+def subscribe(body: SubscriptionIn):
+    """Register (or re-register) a downstream receiver.
+
+    Re-posting an existing name updates its URL and re-activates it. Only
+    versions emitted *after* registration are delivered — a downstream that
+    needs history should first read it via /results/* (that is how existing
+    consumers already booked their state).
+    """
+    if not body.url.startswith(("http://", "https://")):
+        raise HTTPException(422, "url must be an http(s) endpoint")
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """INSERT INTO subscribers (name, url) VALUES (%s, %s)
+                   ON CONFLICT (name) DO UPDATE SET url = EXCLUDED.url, active = TRUE
+                   RETURNING id, name, url, active, created_at""",
+                (body.name, body.url),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    log.info("subscriber registered: %s -> %s", body.name, body.url)
+    return {"subscription": row}
+
+
+@app.get("/subscriptions")
+def subscriptions():
+    """All registered downstreams with their delivery backlog counts."""
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT s.id, s.name, s.url, s.active, s.created_at,
+                          count(d.id) FILTER (WHERE d.status = 'DELIVERED') AS delivered,
+                          count(d.id) FILTER (WHERE d.status = 'RETRYING')  AS retrying,
+                          count(d.id) FILTER (WHERE d.status = 'PENDING')   AS pending
+                   FROM subscribers s
+                   LEFT JOIN deliveries d ON d.subscriber_id = s.id
+                   GROUP BY s.id ORDER BY s.id"""
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {"subscriptions": rows}
+
+
+@app.delete("/subscriptions/{subscriber_id}")
+def unsubscribe(subscriber_id: int):
+    """Deactivate a subscriber: stops dispatch, keeps the delivery records."""
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """UPDATE subscribers SET active = FALSE WHERE id = %s
+                   RETURNING id, name, url, active, created_at""",
+                (subscriber_id,),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise HTTPException(404, "no such subscriber")
+    log.info("subscriber deactivated: %s", row["name"])
+    return {"subscription": row}
+
+
+DELIVERY_COLS = """d.id, s.name AS subscriber, s.url, d.window_start, d.window_end, d.key,
+                   d.version, d.kind, d.status, d.attempts, d.last_error,
+                   d.next_attempt_at, d.last_attempt_at, d.delivered_at, d.created_at"""
+
+
+@app.get("/deliveries")
+def deliveries(window_start: Optional[int] = None, key: Optional[str] = None,
+               subscriber: Optional[str] = None, status: Optional[str] = None,
+               limit: int = Query(default=200)):
+    """Raw outbox view: every (subscriber, result version) delivery row."""
+    sql = f"SELECT {DELIVERY_COLS} FROM deliveries d JOIN subscribers s ON s.id = d.subscriber_id"
+    conds, args = [], []
+    if window_start is not None:
+        conds.append("d.window_start = %s")
+        args.append(window_start)
+    if key is not None:
+        conds.append("d.key = %s")
+        args.append(key)
+    if subscriber is not None:
+        conds.append("s.name = %s")
+        args.append(subscriber)
+    if status is not None:
+        if status not in ("PENDING", "RETRYING", "DELIVERED"):
+            raise HTTPException(422, "status must be PENDING, RETRYING or DELIVERED")
+        conds.append("d.status = %s")
+        args.append(status)
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY d.id DESC LIMIT %s"
+    args.append(min(max(limit, 1), 1000))
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, args)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {"deliveries": rows}
+
+
+@app.get("/results/delivery")
+def result_delivery(window_start: int, key: str):
+    """Per-result delivery ladder: for one result, where each version stands
+    with each downstream — which version is delivered, which is still being
+    retried, and the last contiguously delivered version (delivered_up_to)."""
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"""SELECT {DELIVERY_COLS}, s.active
+                    FROM deliveries d JOIN subscribers s ON s.id = d.subscriber_id
+                    WHERE d.window_start = %s AND d.key = %s
+                    ORDER BY s.name, d.version""",
+                (window_start, key),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    by_sub = {}
+    for r in rows:
+        sub = by_sub.setdefault(r["subscriber"], {
+            "subscriber": r["subscriber"], "url": r["url"], "active": r["active"],
+            "delivered_up_to": None, "versions": [],
+        })
+        sub["versions"].append({
+            "version": r["version"], "kind": r["kind"], "status": r["status"],
+            "attempts": r["attempts"], "last_error": r["last_error"],
+            "next_attempt_at": r["next_attempt_at"], "delivered_at": r["delivered_at"],
+        })
+    for sub in by_sub.values():
+        for v in sub["versions"]:
+            if v["status"] != "DELIVERED":
+                break
+            sub["delivered_up_to"] = v["version"]
+    return {"window_start": window_start, "key": key,
+            "subscribers": list(by_sub.values())}
