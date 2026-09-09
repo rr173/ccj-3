@@ -29,7 +29,9 @@ import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app.core import compute_payload, decide, delivery_kind, retry_delay_ms, window_of
+from app.core import (ORDER_STATUSES, build_order_snapshot, compute_payload,
+                      decide, delivery_kind, evaluate_order, order_reason,
+                      retry_delay_ms, window_of)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -136,6 +138,63 @@ CREATE TABLE IF NOT EXISTS deliveries (
 );
 CREATE INDEX IF NOT EXISTS deliveries_due_idx
     ON deliveries (next_attempt_at) WHERE status <> 'DELIVERED';
+-- Business orders (业务单): one order per business key, assembled from the
+-- aligned window results above. The order row is only a denormalized head;
+-- every state change is an append-only row in biz_order_versions carrying a
+-- full snapshot of each window's bound result version, so the shape of the
+-- order at close time is never overwritten by a later reopen or void.
+CREATE TABLE IF NOT EXISTS biz_orders (
+    id           BIGSERIAL PRIMARY KEY,
+    key          TEXT NOT NULL UNIQUE,   -- one order per business key, forever
+    status       TEXT NOT NULL CHECK (status IN ('OPEN','WAITING','CLOSED','REOPENED','VOID')),
+    head_version INT NOT NULL,
+    ever_closed  BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Current window -> order bindings. UNIQUE(key, window_start) is the hard
+-- guarantee that one window's result can never feed two orders.
+CREATE TABLE IF NOT EXISTS biz_order_windows (
+    order_id       BIGINT NOT NULL REFERENCES biz_orders(id),
+    key            TEXT NOT NULL,
+    window_start   BIGINT NOT NULL,
+    window_end     BIGINT NOT NULL,
+    result_version INT NOT NULL,
+    result_status  TEXT NOT NULL CHECK (result_status IN ('CURRENT','RETRACTED')),
+    has_gap        BOOLEAN NOT NULL,
+    match_count    INT NOT NULL,
+    unmatched_a    INT NOT NULL,
+    unmatched_b    INT NOT NULL,
+    payload_hash   TEXT,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (order_id, window_start),
+    UNIQUE (key, window_start)
+);
+CREATE TABLE IF NOT EXISTS biz_order_versions (
+    id                     BIGSERIAL PRIMARY KEY,
+    order_id               BIGINT NOT NULL REFERENCES biz_orders(id),
+    version                INT NOT NULL,
+    status                 TEXT NOT NULL CHECK (status IN ('OPEN','WAITING','CLOSED','REOPENED','VOID')),
+    reason                 TEXT NOT NULL CHECK (reason IN
+                           ('ORDER_OPENED','WINDOW_JOINED','WINDOW_CORRECTED',
+                            'WINDOW_WITHDRAWN','WINDOW_REVIVED')),
+    trigger_window_start   BIGINT NOT NULL,   -- which window caused this version
+    trigger_result_version INT NOT NULL,      -- ... at which result version
+    trigger_result_id      BIGINT NOT NULL,
+    snapshot               JSONB NOT NULL,    -- every window's bound result version
+    missing_windows        JSONB NOT NULL,    -- due business windows not yet in the order
+    pending_windows        JSONB NOT NULL,    -- business windows known from events, not yet due
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (order_id, version)
+);
+-- Order-builder checkpoint: results.id up to which orders have been built.
+-- Updated in the same transaction as each order version, so a crash mid-build
+-- replays at most the uncommitted tail and that replay is a no-op.
+CREATE TABLE IF NOT EXISTS biz_order_state (
+    id             SMALLINT PRIMARY KEY,
+    last_result_id BIGINT NOT NULL DEFAULT 0
+);
+INSERT INTO biz_order_state (id) VALUES (1) ON CONFLICT DO NOTHING;
 """
 
 
@@ -363,6 +422,150 @@ def close_windows(conn):
             emit(conn, ws, key, "INITIAL", {"min_watermark": min_wm})
 
 
+# ---------------------------------------------------------------------------
+# business orders (业务单)
+# ---------------------------------------------------------------------------
+# One order per business key, built by folding every committed result version
+# into the key's order in results.id order. The order's status is derived from
+# its window bindings: OPEN while known business windows are still missing or
+# pending, WAITING when only one-sided gaps remain, CLOSED when every window
+# is in and fully matched, REOPENED when a closed order is undone by a later
+# correction/withdrawal, VOID when the whole business is withdrawn. Every
+# transition appends a full-snapshot version — the close-time shape of the
+# order is never overwritten by a later reopen or void.
+
+def business_windows(cur, key):
+    """Windows holding at least one effective (non-retracted) upsert for key."""
+    cur.execute(
+        """SELECT DISTINCT (e.event_time / %s) * %s AS ws
+           FROM stream_events e
+           WHERE e.key = %s AND e.type = 'upsert'
+             AND NOT EXISTS (
+                 SELECT 1 FROM stream_events r
+                 WHERE r.type = 'retract' AND r.stream = e.stream
+                       AND r.retracts = e.event_id
+             )""",
+        (WINDOW_MS, WINDOW_MS, key),
+    )
+    return {row[0] for row in cur.fetchall()}
+
+
+def order_window_gaps(cur, key, bound):
+    """Unbound business windows, split into missing (due) and pending (not yet)."""
+    wms = current_watermarks(cur)
+    ready = len(wms) == len(INGESTS) and all(w is not None for w in wms.values())
+    min_wm = min(wms.values()) if ready else None
+    missing, pending = [], []
+    for ws in business_windows(cur, key) - bound:
+        if min_wm is not None and ws + WINDOW_MS <= min_wm:
+            missing.append(ws)
+        else:
+            pending.append(ws)
+    return sorted(missing), sorted(pending)
+
+
+def apply_result_to_order(conn, result):
+    """Fold one committed result version into its key's order.
+
+    Binding upsert + new order version (full snapshot) + head update + builder
+    checkpoint all commit in one transaction; replaying the same result row
+    after a crash redoes the identical write, so the builder is idempotent.
+    """
+    key, ws, we = result["key"], result["window_start"], result["window_end"]
+    payload = result["payload"]
+    # The row's status may later be flipped to SUPERSEDED; the status it was
+    # *emitted* with is derivable from the payload: live iff payload present.
+    result_status = "CURRENT" if payload is not None else "RETRACTED"
+    has_gap = bool(payload and (payload["unmatched_a"] or payload["unmatched_b"]))
+    match_count = payload["match_count"] if payload else 0
+    unmatched_a = len(payload["unmatched_a"]) if payload else 0
+    unmatched_b = len(payload["unmatched_b"]) if payload else 0
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO biz_orders (key, status, head_version)
+               VALUES (%s, 'OPEN', 0) ON CONFLICT (key) DO NOTHING""",
+            (key,),
+        )
+        cur.execute("SELECT id, head_version, ever_closed FROM biz_orders WHERE key = %s", (key,))
+        order_id, head_version, ever_closed = cur.fetchone()
+
+        cur.execute(
+            "SELECT result_status FROM biz_order_windows WHERE key = %s AND window_start = %s",
+            (key, ws),
+        )
+        prev = cur.fetchone()
+        cur.execute(
+            """INSERT INTO biz_order_windows
+                   (order_id, key, window_start, window_end, result_version, result_status,
+                    has_gap, match_count, unmatched_a, unmatched_b, payload_hash)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (key, window_start) DO UPDATE SET
+                   result_version = EXCLUDED.result_version,
+                   result_status  = EXCLUDED.result_status,
+                   has_gap        = EXCLUDED.has_gap,
+                   match_count    = EXCLUDED.match_count,
+                   unmatched_a    = EXCLUDED.unmatched_a,
+                   unmatched_b    = EXCLUDED.unmatched_b,
+                   payload_hash   = EXCLUDED.payload_hash,
+                   updated_at     = now()""",
+            (order_id, key, ws, we, result["version"], result_status, has_gap,
+             match_count, unmatched_a, unmatched_b, result["payload_hash"]),
+        )
+        cur.execute(
+            """SELECT window_start, window_end, result_version, result_status, has_gap,
+                      match_count, unmatched_a, unmatched_b, payload_hash
+               FROM biz_order_windows WHERE order_id = %s ORDER BY window_start""",
+            (order_id,),
+        )
+        cols = [d[0] for d in cur.description]
+        bindings = [dict(zip(cols, row)) for row in cur.fetchall()]
+        missing, pending = order_window_gaps(cur, key, {b["window_start"] for b in bindings})
+        status = evaluate_order(bindings, missing, pending, ever_closed)
+        reason = "ORDER_OPENED" if head_version == 0 else order_reason(
+            prev[0] if prev else None, result_status)
+        version = head_version + 1
+        cur.execute(
+            """INSERT INTO biz_order_versions
+                   (order_id, version, status, reason, trigger_window_start,
+                    trigger_result_version, trigger_result_id, snapshot,
+                    missing_windows, pending_windows)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (order_id, version, status, reason, ws, result["version"], result["id"],
+             psycopg2.extras.Json(build_order_snapshot(bindings)),
+             psycopg2.extras.Json(missing), psycopg2.extras.Json(pending)),
+        )
+        cur.execute(
+            """UPDATE biz_orders
+               SET status = %s, head_version = %s,
+                   ever_closed = ever_closed OR %s, updated_at = now()
+               WHERE id = %s""",
+            (status, version, status == "CLOSED", order_id),
+        )
+        cur.execute("UPDATE biz_order_state SET last_result_id = %s WHERE id = 1",
+                    (result["id"],))
+    log.info("order key=%s -> v%d (%s, %s) by window=%d result v%d",
+             key, version, status, reason, ws, result["version"])
+
+
+def build_orders(conn):
+    """Drain newly committed result versions into orders, in results.id order."""
+    with conn, conn.cursor() as cur:
+        cur.execute("SELECT last_result_id FROM biz_order_state WHERE id = 1")
+        last = cur.fetchone()[0]
+    while True:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM results WHERE id > %s ORDER BY id LIMIT %s",
+                        (last, BATCH))
+            rows = cur.fetchall()
+        if not rows:
+            return
+        for row in rows:
+            apply_result_to_order(conn, row)
+        last = rows[-1]["id"]
+        if len(rows) < BATCH:
+            return
+
+
 def tick(conn):
     dirty = []
     for stream, base_url in INGESTS.items():
@@ -380,6 +583,7 @@ def tick(conn):
         if head is not None:
             emit(conn, ws, key, reason, detail)
     close_windows(conn)
+    build_orders(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -688,6 +892,98 @@ def windows():
             "head_status": head["status"] if head else None,
         })
     return {"windows": out, "min_watermark": min_wm}
+
+
+# ---------------------------------------------------------------------------
+# business order queries
+# ---------------------------------------------------------------------------
+
+@app.get("/orders")
+def orders(status: Optional[str] = None, key: Optional[str] = None):
+    """Head state of every business order. ``status`` filters the lifecycle
+    state (OPEN / WAITING / CLOSED / REOPENED / VOID) — success orders are
+    exactly the CLOSED ones; VOID orders never count as successes."""
+    if status is not None and status not in ORDER_STATUSES:
+        raise HTTPException(422, f"status must be one of {ORDER_STATUSES}")
+    sql = """SELECT o.id, o.key, o.status, o.head_version, o.ever_closed,
+                    o.created_at, o.updated_at,
+                    count(w.order_id) AS windows,
+                    count(w.order_id) FILTER (WHERE w.result_status = 'CURRENT') AS live_windows,
+                    count(w.order_id) FILTER (WHERE w.has_gap) AS gap_windows
+             FROM biz_orders o
+             LEFT JOIN biz_order_windows w ON w.order_id = o.id"""
+    conds, args = [], []
+    if status is not None:
+        conds.append("o.status = %s")
+        args.append(status)
+    if key is not None:
+        conds.append("o.key = %s")
+        args.append(key)
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " GROUP BY o.id ORDER BY o.id"
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, args)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {"orders": rows}
+
+
+@app.get("/orders/current")
+def orders_current(key: str):
+    """One order as it stands now: which result version each window entered
+    at, plus the business windows still missing or pending."""
+    conn = connect()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM biz_orders WHERE key = %s", (key,))
+                order = cur.fetchone()
+                if order is None:
+                    return {"order": None}
+                cur.execute(
+                    """SELECT window_start, window_end, result_version, result_status,
+                              has_gap, match_count, unmatched_a, unmatched_b, payload_hash
+                       FROM biz_order_windows WHERE order_id = %s ORDER BY window_start""",
+                    (order["id"],),
+                )
+                windows = cur.fetchall()
+            # gap helpers expect tuple rows — use a plain cursor here
+            with conn.cursor() as cur:
+                missing, pending = order_window_gaps(
+                    cur, key, {w["window_start"] for w in windows})
+    finally:
+        conn.close()
+    return {"order": {**order, "windows": windows,
+                      "missing_windows": missing, "pending_windows": pending}}
+
+
+@app.get("/orders/history")
+def orders_history(key: str):
+    """Every version of one order: status, why it changed, which window and
+    which result version triggered it, and the full per-window snapshot as of
+    that version (the close-time shape is preserved across reopens/voids)."""
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM biz_orders WHERE key = %s", (key,))
+            order = cur.fetchone()
+            if order is None:
+                return {"order": None, "versions": []}
+            cur.execute(
+                """SELECT version, status, reason, trigger_window_start,
+                          trigger_result_version, trigger_result_id, snapshot,
+                          missing_windows, pending_windows, created_at
+                   FROM biz_order_versions WHERE order_id = %s ORDER BY version""",
+                (order["id"],),
+            )
+            versions = cur.fetchall()
+    finally:
+        conn.close()
+    return {"order": order, "versions": versions}
 
 
 # ---------------------------------------------------------------------------

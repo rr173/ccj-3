@@ -111,3 +111,78 @@ def decide(head, new_payload):
         "status": "CURRENT" if new_payload is not None else "RETRACTED",
         "payload_hash": new_hash,
     }
+
+
+# ---------------------------------------------------------------------------
+# business orders (业务单): one order per business key, assembled from the
+# aligned window results. Pure state machine — the service layer supplies the
+# current bindings and the window-gaps view, this decides the order's status.
+# ---------------------------------------------------------------------------
+
+ORDER_STATUSES = ("OPEN", "WAITING", "CLOSED", "REOPENED", "VOID")
+
+ORDER_REASONS = ("ORDER_OPENED", "WINDOW_JOINED", "WINDOW_CORRECTED",
+                 "WINDOW_WITHDRAWN", "WINDOW_REVIVED")
+
+
+def evaluate_order(bindings, missing, pending, ever_closed):
+    """Decide an order's status from its current window bindings.
+
+    ``bindings``    — one dict per bound window: {"result_status", "has_gap"}.
+    ``missing``     — due business windows (effective events exist, watermark
+                      has passed) whose results are not in the order yet.
+    ``pending``     — business windows known from events but not yet due.
+    ``ever_closed`` — the order has reached CLOSED at least once before.
+
+    CLOSE requires all of: at least one live window; every known business
+    window bound (nothing missing or pending); no live window still waiting
+    for the opposite side. All windows withdrawn -> VOID (the business is
+    gone, not a success). Anything short of CLOSE is OPEN while windows are
+    still being collected and WAITING once only one-sided gaps remain —
+    labelled REOPENED instead once the order has been closed before, so a
+    closed-then-undone order never quietly shows "closed" again.
+    """
+    live = [b for b in bindings if b["result_status"] == "CURRENT"]
+    if not live:
+        return "VOID"
+    if missing or pending:
+        return "REOPENED" if ever_closed else "OPEN"
+    if any(b["has_gap"] for b in live):
+        return "REOPENED" if ever_closed else "WAITING"
+    return "CLOSED"
+
+
+def order_reason(prev_status, new_status):
+    """Classify what a result version did to its window's binding.
+
+    ``prev_status`` is None when the window enters the order for the first
+    time (the caller turns the very first version of an order into
+    ORDER_OPENED instead).
+    """
+    if prev_status is None:
+        return "WINDOW_JOINED"
+    if new_status == "RETRACTED":
+        return "WINDOW_WITHDRAWN"
+    if prev_status == "RETRACTED":
+        return "WINDOW_REVIVED"
+    return "WINDOW_CORRECTED"
+
+
+def build_order_snapshot(bindings):
+    """Deterministic full-order snapshot: every window and the result version
+    it is bound to, ordered by window. Stored on each order version so the
+    close-time shape of the order is preserved forever."""
+    return [
+        {
+            "window_start": b["window_start"],
+            "window_end": b["window_end"],
+            "result_version": b["result_version"],
+            "result_status": b["result_status"],
+            "has_gap": b["has_gap"],
+            "match_count": b["match_count"],
+            "unmatched_a": b["unmatched_a"],
+            "unmatched_b": b["unmatched_b"],
+            "payload_hash": b["payload_hash"],
+        }
+        for b in sorted(bindings, key=lambda b: b["window_start"])
+    ]

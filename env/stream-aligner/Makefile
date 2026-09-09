@@ -16,9 +16,11 @@ demo:          ## run the scripted end-to-end walkthrough
 
 test:          ## e2e test against a running stack
 	python3 tests/test_e2e.py
+	python3 tests/test_orders_e2e.py
 
 unit:          ## dependency-free unit tests of the alignment core
 	python3 tests/test_core.py
+	python3 tests/test_order_core.py
 
 psql:          ## open psql on the aligner database
 	$(COMPOSE) exec postgres psql -U postgres -d aligner

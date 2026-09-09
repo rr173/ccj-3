@@ -125,4 +125,94 @@ curl -sf "$R/deliveries?window_start=$WS&key=order-1" | json
 echo "subscription backlog counters:"
 curl -sf "$R/subscriptions" | json
 
+# ---------------------------------------------------------------------------
+# business orders: one business key spanning two windows, full lifecycle
+# ---------------------------------------------------------------------------
+say "11. business orders: one key across two windows (open -> waiting -> closed)"
+WS2=$(( $(python3 -c 'import time; print(int(time.time()*1000))') / WINDOW_MS * WINDOW_MS ))
+OKEY="order-2"
+echo "order windows: [$WS2, $((WS2+WINDOW_MS))) and [$((WS2+WINDOW_MS)), $((WS2+2*WINDOW_MS)))"
+post "$A/events" '{"events":[
+  {"event_id":"o2-a1","event_time":'"$((WS2+1000))"',"key":"'"$OKEY"'","payload":{"amount":10}},
+  {"event_id":"o2-a2","event_time":'"$((WS2+WINDOW_MS+1000))"',"key":"'"$OKEY"'","payload":{"amount":20}}]}' >/dev/null
+post "$B/events" '{"event_id":"o2-b1","event_time":'"$((WS2+1500))"',"key":"'"$OKEY"'","payload":{"ship":"DHL"}}' >/dev/null
+# pin both watermarks so only the first window closes (deterministic staging)
+post "$A/watermark/override" "{\"watermark\":$((WS2+WINDOW_MS))}" >/dev/null
+post "$B/watermark/override" "{\"watermark\":$((WS2+WINDOW_MS))}" >/dev/null
+sleep 3
+echo "first window closed, second still pending -> order is OPEN:"
+curl -sf "$R/orders/current?key=$OKEY" | json
+
+say "11b. second window closes single-sided -> WAITING (waiting for the other side)"
+post "$A/watermark/override" "{\"watermark\":$((WS2+2*WINDOW_MS))}" >/dev/null
+post "$B/watermark/override" "{\"watermark\":$((WS2+2*WINDOW_MS))}" >/dev/null
+sleep 3
+curl -sf "$R/orders/current?key=$OKEY" | json
+
+say "11c. late B event matches the gap -> CLOSED (success order)"
+post "$B/events" '{"event_id":"o2-b2","event_time":'"$((WS2+WINDOW_MS+1500))"',"key":"'"$OKEY"'","payload":{"ship":"UPS"}}' >/dev/null
+sleep 3
+curl -sf "$R/orders/current?key=$OKEY" | json
+echo "close snapshot: each window bound at its result version"
+curl -sf "$R/orders/history?key=$OKEY" | python3 -c '
+import json, sys
+h = json.load(sys.stdin)
+for v in h["versions"]:
+    if v["status"] == "CLOSED":
+        print(json.dumps({"version": v["version"], "reason": v["reason"],
+                          "snapshot": [(w["window_start"], w["result_version"]) for w in v["snapshot"]]},
+                         ensure_ascii=False))
+        break'
+
+say "11d. correction after close -> REOPENED (which window, which result version)"
+post "$A/events" '{"event_id":"o2-r1","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-a1"}' >/dev/null
+sleep 3
+curl -sf "$R/orders/current?key=$OKEY" | json
+echo "why was it reopened:"
+curl -sf "$R/orders/history?key=$OKEY" | python3 -c '
+import json, sys
+h = json.load(sys.stdin)
+v = h["versions"][-1]
+print(json.dumps({k: v[k] for k in ("version", "status", "reason",
+      "trigger_window_start", "trigger_result_version")}, ensure_ascii=False))'
+
+say "11e. repair the gap -> CLOSED again (new order version, close snapshot kept)"
+post "$A/events" '{"event_id":"o2-a3","event_time":'"$((WS2+500))"',"key":"'"$OKEY"'","payload":{"amount":10}}' >/dev/null
+sleep 3
+curl -sf "$R/orders/current?key=$OKEY" | json
+
+say "11f. withdraw the whole business -> VOID (never a success order)"
+post "$A/events" '{"events":[
+  {"event_id":"o2-r2","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-a3"},
+  {"event_id":"o2-r3","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-a2"}]}' >/dev/null
+post "$B/events" '{"events":[
+  {"event_id":"o2-r4","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-b1"},
+  {"event_id":"o2-r5","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-b2"}]}' >/dev/null
+sleep 4
+curl -sf "$R/orders/current?key=$OKEY" | json
+echo "voided orders are not success orders:"
+curl -sf "$R/orders?status=CLOSED" | python3 -c '
+import json, sys
+print("  CLOSED keys:", [o["key"] for o in json.load(sys.stdin)["orders"]])'
+curl -sf "$R/orders?status=VOID" | python3 -c '
+import json, sys
+print("  VOID keys:  ", [o["key"] for o in json.load(sys.stdin)["orders"]])'
+
+say "11g. new results after void: the SAME order continues (a voided order can never pose as new)"
+post "$A/events" '{"event_id":"o2-a4","event_time":'"$((WS2+800))"',"key":"'"$OKEY"'","payload":{"amount":11}}' >/dev/null
+post "$B/events" '{"event_id":"o2-b4","event_time":'"$((WS2+1200))"',"key":"'"$OKEY"'","payload":{"ship":"SF"}}' >/dev/null
+sleep 3
+curl -sf "$R/orders/current?key=$OKEY" | json
+echo "full order history (the void chapter stays on record):"
+curl -sf "$R/orders/history?key=$OKEY" | python3 -c '
+import json, sys
+h = json.load(sys.stdin)
+for v in h["versions"]:
+    print("  v%-2d %-8s %-18s trigger=(%d, result v%d)" % (
+        v["version"], v["status"], v["reason"],
+        v["trigger_window_start"], v["trigger_result_version"]))'
+post "$A/watermark/override" '{"watermark":null}' >/dev/null
+post "$B/watermark/override" '{"watermark":null}' >/dev/null
+echo "overrides cleared"
+
 say "demo finished OK"
