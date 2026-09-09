@@ -1,0 +1,77 @@
+name: stream-aligner
+
+# Three independently deployable services (ingest-a, ingest-b, aligner) plus
+# one Postgres container holding three separate logical databases. Each
+# service only ever touches its own database and can be rebuilt, restarted or
+# moved to another host on its own.
+
+x-ingest-common: &ingest-common
+  build:
+    context: .
+    dockerfile: services/ingest/Dockerfile
+  environment:
+    # Demo-friendly defaults: 5s lateness grace, 20s idle timeout.
+    WATERMARK_GRACE_MS: "5000"
+    IDLE_TIMEOUT_MS: "20000"
+  depends_on:
+    postgres:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5432:5432"
+
+  ingest-a:
+    <<: *ingest-common
+    environment:
+      STREAM_NAME: a
+      DATABASE_DSN: host=postgres port=5432 dbname=stream_a user=postgres password=postgres
+      WATERMARK_GRACE_MS: "5000"
+      IDLE_TIMEOUT_MS: "20000"
+    ports:
+      - "8001:8000"
+
+  ingest-b:
+    <<: *ingest-common
+    environment:
+      STREAM_NAME: b
+      DATABASE_DSN: host=postgres port=5432 dbname=stream_b user=postgres password=postgres
+      WATERMARK_GRACE_MS: "5000"
+      IDLE_TIMEOUT_MS: "20000"
+    ports:
+      - "8002:8000"
+
+  aligner:
+    build:
+      context: .
+      dockerfile: services/aligner/Dockerfile
+    environment:
+      DATABASE_DSN: host=postgres port=5432 dbname=aligner user=postgres password=postgres
+      INGEST_A_URL: http://ingest-a:8000
+      INGEST_B_URL: http://ingest-b:8000
+      WINDOW_SIZE_MS: "30000"
+      POLL_INTERVAL_MS: "1000"
+    depends_on:
+      ingest-a:
+        condition: service_started
+      ingest-b:
+        condition: service_started
+    ports:
+      - "8003:8000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
