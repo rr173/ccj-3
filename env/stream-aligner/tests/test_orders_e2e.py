@@ -191,14 +191,23 @@ def main():
     void_head = order(k1)["head_version"]
     post(A, "/events", ev(f"{k1}-a4", ws0 + 800, k1))
     post(B, "/events", ev(f"{k1}-b4", ws0 + 1200, k1))
-    o = wait_for("new results after void revive the same order",
-                 lambda: (x := order(k1)) and x["status"] == "CLOSED" and x)
+    o = wait_for("reviving one window of a voided order reopens it",
+                 lambda: (x := order(k1)) and x["status"] == "REOPENED" and x)
     if o:
         check("revival keeps the same order id and continues its version chain",
               o["id"] == order_id and o["head_version"] > void_head,
               f"id={o['id']} head={o['head_version']}")
-        check("void chapter stays in the order's history",
-              bool(versions(k1, "VOID")) and versions(k1)[0]["version"] == 1)
+        check("the still-withdrawn window keeps the revived order from closing",
+              any(w["window_start"] == ws1 and w["result_status"] == "RETRACTED"
+                  for w in o["windows"]), str(o["windows"]))
+    post(A, "/events", ev(f"{k1}-a5", ws1 + 800, k1))
+    post(B, "/events", ev(f"{k1}-b5", ws1 + 1200, k1))
+    o = wait_for("reviving every window closes the order again",
+                 lambda: (x := order(k1)) and x["status"] == "CLOSED" and x)
+    if o:
+        check("re-closed order is still the same order, void chapter on record",
+              o["id"] == order_id and bool(versions(k1, "VOID"))
+              and versions(k1)[0]["version"] == 1)
     all_k1 = [x for x in get(R, "/orders", key=k1)["orders"]]
     check("one order per business key, always", len(all_k1) == 1, str(all_k1))
 
@@ -238,8 +247,63 @@ def main():
           and h3[1]["trigger_window_start"] == ws0
           and h3[1]["trigger_result_version"] == 1, str(h3))
 
+    # =========================================================================
+    # K4: a post-close correction must reopen even when both sides still match
+    # =========================================================================
+    k4 = f"{tag}-benign"
+    post(A, "/events", ev(f"{k4}-a1", ws0 + 1000, k4))
+    post(B, "/events", ev(f"{k4}-b1", ws0 + 1500, k4))
+    o = wait_for("K4 closes on its single matched window",
+                 lambda: (x := order(k4)) and x["status"] == "CLOSED" and x)
+    # benign correction: add another matched pair to the same closed window
+    post(A, "/events", ev(f"{k4}-a2", ws0 + 2000, k4))
+    post(B, "/events", ev(f"{k4}-b2", ws0 + 2500, k4))
+    o = wait_for("correction after close reopens even though it still matches",
+                 lambda: (x := order(k4)) and x["status"] == "REOPENED"
+                 and not any(w["has_gap"] for w in x["windows"]) and x)
+    if o:
+        check("reopened order is fully matched (nothing missing, no gap)",
+              o["missing_windows"] == [] and o["pending_windows"] == [], str(o["windows"]))
+    v = versions(k4)[-1]
+    check("the reopen is pinned to the correcting window and result version",
+          v["reason"] == "WINDOW_CORRECTED" and v["trigger_window_start"] == ws0
+          and v["trigger_result_version"] == 2, str(v))
+    # a later trigger finding the conditions met re-closes it
+    post(A, "/events", ev(f"{k4}-a3", ws0 + 3000, k4))
+    post(B, "/events", ev(f"{k4}-b3", ws0 + 3500, k4))
+    wait_for("order re-closes when later activity finds it complete",
+             lambda: (x := order(k4)) and x["status"] == "CLOSED" and x)
+
+    # =========================================================================
+    # K5: withdrawing one window of a closed order reopens it — and it must
+    #     NOT close again while that window stays withdrawn
+    # =========================================================================
+    k5 = f"{tag}-partial"
+    post(A, "/events", {"events": [ev(f"{k5}-a1", ws0 + 1000, k5),
+                                   ev(f"{k5}-a2", ws1 + 1000, k5)]})
+    post(B, "/events", {"events": [ev(f"{k5}-b1", ws0 + 1500, k5),
+                                   ev(f"{k5}-b2", ws1 + 1500, k5)]})
+    o = wait_for("K5 closes with both windows matched",
+                 lambda: (x := order(k5)) and x["status"] == "CLOSED" and x)
+    retract(A, f"{k5}-r1", f"{k5}-a1", k5)
+    retract(B, f"{k5}-r2", f"{k5}-b1", k5)
+    o = wait_for("withdrawing one window reopens the order",
+                 lambda: (x := order(k5)) and x["status"] == "REOPENED" and x)
+    if o:
+        check("the withdrawn window blocks re-closing while the other is live",
+              any(w["window_start"] == ws0 and w["result_status"] == "RETRACTED"
+                  for w in o["windows"])
+              and any(w["window_start"] == ws1 and w["result_status"] == "CURRENT"
+                      for w in o["windows"]), str(o["windows"]))
+    time.sleep(3)  # let the builder settle — it must not flip back to CLOSED
+    o = order(k5)
+    check("order is still not closed with a withdrawn window unresolved",
+          o["status"] == "REOPENED", o["status"])
+    check("K5 never counts as a success order in this state",
+          k5 not in {x["key"] for x in get(R, "/orders", status="CLOSED")["orders"]})
+
     # -- every window bound to exactly one order ------------------------------
-    for key in (k1, k2, k3):
+    for key in (k1, k2, k3, k4, k5):
         o = order(key)
         wss = [w["window_start"] for w in o["windows"]]
         check(f"windows of {key} bound to exactly one order, no duplicates",

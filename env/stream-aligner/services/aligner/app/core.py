@@ -125,7 +125,7 @@ ORDER_REASONS = ("ORDER_OPENED", "WINDOW_JOINED", "WINDOW_CORRECTED",
                  "WINDOW_WITHDRAWN", "WINDOW_REVIVED")
 
 
-def evaluate_order(bindings, missing, pending, ever_closed):
+def evaluate_order(bindings, missing, pending, ever_closed, head_status, reason):
     """Decide an order's status from its current window bindings.
 
     ``bindings``    — one dict per bound window: {"result_status", "has_gap"}.
@@ -133,19 +133,28 @@ def evaluate_order(bindings, missing, pending, ever_closed):
                       has passed) whose results are not in the order yet.
     ``pending``     — business windows known from events but not yet due.
     ``ever_closed`` — the order has reached CLOSED at least once before.
+    ``head_status`` — the order's current head status.
+    ``reason``      — what the triggering result version did to its window.
 
     CLOSE requires all of: at least one live window; every known business
-    window bound (nothing missing or pending); no live window still waiting
-    for the opposite side. All windows withdrawn -> VOID (the business is
-    gone, not a success). Anything short of CLOSE is OPEN while windows are
-    still being collected and WAITING once only one-sided gaps remain —
-    labelled REOPENED instead once the order has been closed before, so a
-    closed-then-undone order never quietly shows "closed" again.
+    window bound (nothing missing or pending); no withdrawn window left
+    unresolved; no live window still waiting for the opposite side. All
+    windows withdrawn -> VOID (the business is gone, not a success).
+
+    A correction or withdrawal landing on a CLOSED order always reopens it —
+    the order must never sail through a post-close change still showing
+    CLOSED, even if everything still matches. It re-closes when a *later*
+    trigger finds the close conditions met again. Anything else short of
+    CLOSE is OPEN while windows are still being collected and WAITING once
+    only one-sided gaps remain — labelled REOPENED instead once the order
+    has been closed before.
     """
     live = [b for b in bindings if b["result_status"] == "CURRENT"]
     if not live:
         return "VOID"
-    if missing or pending:
+    if head_status == "CLOSED" and reason in ("WINDOW_CORRECTED", "WINDOW_WITHDRAWN"):
+        return "REOPENED"
+    if missing or pending or any(b["result_status"] == "RETRACTED" for b in bindings):
         return "REOPENED" if ever_closed else "OPEN"
     if any(b["has_gap"] for b in live):
         return "REOPENED" if ever_closed else "WAITING"

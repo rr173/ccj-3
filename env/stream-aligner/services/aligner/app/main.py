@@ -486,8 +486,11 @@ def apply_result_to_order(conn, result):
                VALUES (%s, 'OPEN', 0) ON CONFLICT (key) DO NOTHING""",
             (key,),
         )
-        cur.execute("SELECT id, head_version, ever_closed FROM biz_orders WHERE key = %s", (key,))
-        order_id, head_version, ever_closed = cur.fetchone()
+        cur.execute(
+            "SELECT id, head_version, ever_closed, status FROM biz_orders WHERE key = %s",
+            (key,),
+        )
+        order_id, head_version, ever_closed, head_status = cur.fetchone()
 
         cur.execute(
             "SELECT result_status FROM biz_order_windows WHERE key = %s AND window_start = %s",
@@ -520,9 +523,10 @@ def apply_result_to_order(conn, result):
         cols = [d[0] for d in cur.description]
         bindings = [dict(zip(cols, row)) for row in cur.fetchall()]
         missing, pending = order_window_gaps(cur, key, {b["window_start"] for b in bindings})
-        status = evaluate_order(bindings, missing, pending, ever_closed)
         reason = "ORDER_OPENED" if head_version == 0 else order_reason(
             prev[0] if prev else None, result_status)
+        status = evaluate_order(bindings, missing, pending, ever_closed,
+                                head_status, reason)
         version = head_version + 1
         cur.execute(
             """INSERT INTO biz_order_versions

@@ -164,30 +164,53 @@ for v in h["versions"]:
                          ensure_ascii=False))
         break'
 
-say "11d. correction after close -> REOPENED (which window, which result version)"
-post "$A/events" '{"event_id":"o2-r1","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-a1"}' >/dev/null
+say "11d. benign correction after close -> REOPENED even though it still matches"
+# add another matched pair to the already-closed first window: the window's
+# content changes but both sides still match — the order must still reopen
+post "$A/events" '{"event_id":"o2-a3","event_time":'"$((WS2+500))"',"key":"'"$OKEY"'","payload":{"amount":11}}' >/dev/null
+post "$B/events" '{"event_id":"o2-b3","event_time":'"$((WS2+800))"',"key":"'"$OKEY"'","payload":{"ship":"DHL"}}' >/dev/null
 sleep 3
+echo "still fully matched, yet NOT closed:"
 curl -sf "$R/orders/current?key=$OKEY" | json
-echo "why was it reopened:"
+echo "why was it reopened (which window, which result version):"
 curl -sf "$R/orders/history?key=$OKEY" | python3 -c '
 import json, sys
 h = json.load(sys.stdin)
 v = h["versions"][-1]
 print(json.dumps({k: v[k] for k in ("version", "status", "reason",
       "trigger_window_start", "trigger_result_version")}, ensure_ascii=False))'
-
-say "11e. repair the gap -> CLOSED again (new order version, close snapshot kept)"
-post "$A/events" '{"event_id":"o2-a3","event_time":'"$((WS2+500))"',"key":"'"$OKEY"'","payload":{"amount":10}}' >/dev/null
+echo "and it re-closes when later activity finds it complete again:"
+post "$A/events" '{"event_id":"o2-a4","event_time":'"$((WS2+600))"',"key":"'"$OKEY"'","payload":{"amount":12}}' >/dev/null
+post "$B/events" '{"event_id":"o2-b4","event_time":'"$((WS2+900))"',"key":"'"$OKEY"'","payload":{"ship":"UPS"}}' >/dev/null
 sleep 3
+curl -sf "$R/orders/current?key=$OKEY" | python3 -c '
+import json, sys
+o = json.load(sys.stdin)["order"]
+print("  status:", o["status"], " head_version:", o["head_version"])'
+
+say "11e. withdraw ONE window of the closed order -> REOPENED, and it stays open"
+# retract everything in the second window; the first window is still matched
+post "$A/events" '{"event_id":"o2-r1","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-a2"}' >/dev/null
+post "$B/events" '{"event_id":"o2-r2","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-b2"}' >/dev/null
+sleep 3
+echo "one window withdrawn, the other still matched — must NOT show closed:"
 curl -sf "$R/orders/current?key=$OKEY" | json
+sleep 3
+echo "and it does not flip back to closed while the withdrawal is unresolved:"
+curl -sf "$R/orders/current?key=$OKEY" | python3 -c '
+import json, sys
+o = json.load(sys.stdin)["order"]
+print("  status:", o["status"])'
 
 say "11f. withdraw the whole business -> VOID (never a success order)"
 post "$A/events" '{"events":[
-  {"event_id":"o2-r2","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-a3"},
-  {"event_id":"o2-r3","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-a2"}]}' >/dev/null
+  {"event_id":"o2-r3","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-a1"},
+  {"event_id":"o2-r4","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-a3"},
+  {"event_id":"o2-r5","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-a4"}]}' >/dev/null
 post "$B/events" '{"events":[
-  {"event_id":"o2-r4","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-b1"},
-  {"event_id":"o2-r5","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-b2"}]}' >/dev/null
+  {"event_id":"o2-r6","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-b1"},
+  {"event_id":"o2-r7","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-b3"},
+  {"event_id":"o2-r8","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$OKEY"'","type":"retract","retracts":"o2-b4"}]}' >/dev/null
 sleep 4
 curl -sf "$R/orders/current?key=$OKEY" | json
 echo "voided orders are not success orders:"
@@ -199,8 +222,12 @@ import json, sys
 print("  VOID keys:  ", [o["key"] for o in json.load(sys.stdin)["orders"]])'
 
 say "11g. new results after void: the SAME order continues (a voided order can never pose as new)"
-post "$A/events" '{"event_id":"o2-a4","event_time":'"$((WS2+800))"',"key":"'"$OKEY"'","payload":{"amount":11}}' >/dev/null
-post "$B/events" '{"event_id":"o2-b4","event_time":'"$((WS2+1200))"',"key":"'"$OKEY"'","payload":{"ship":"SF"}}' >/dev/null
+post "$A/events" '{"events":[
+  {"event_id":"o2-a5","event_time":'"$((WS2+700))"',"key":"'"$OKEY"'","payload":{"amount":13}},
+  {"event_id":"o2-a6","event_time":'"$((WS2+WINDOW_MS+700))"',"key":"'"$OKEY"'","payload":{"amount":23}}]}' >/dev/null
+post "$B/events" '{"events":[
+  {"event_id":"o2-b5","event_time":'"$((WS2+1100))"',"key":"'"$OKEY"'","payload":{"ship":"SF"}},
+  {"event_id":"o2-b6","event_time":'"$((WS2+WINDOW_MS+1100))"',"key":"'"$OKEY"'","payload":{"ship":"SF"}}]}' >/dev/null
 sleep 3
 curl -sf "$R/orders/current?key=$OKEY" | json
 echo "full order history (the void chapter stays on record):"
