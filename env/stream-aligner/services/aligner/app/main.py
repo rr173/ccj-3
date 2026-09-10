@@ -2,16 +2,17 @@
 
 Continuously pulls both ingest streams, maintains a per-stream watermark, and
 emits aligned business results per (window, key) once *that key's own two
-sides* have both crossed the window end — each side crosses either by the
-key's own newer events or by a real (non-idle) watermark promise. The gate is
+sides* have both crossed the window end — each side crosses by its own newer
+events, by a real (non-idle) watermark promise, or, once the stream has gone
+idle, by simply already having data on that side in that window. The gate is
 per business key: one quiet business never stalls the others, a slow business
-simply keeps waiting (never dropped), and an idle stream's wall-clock
-watermark never finalizes businesses still waiting. Late events and
-retractions recompute already-emitted windows and produce new, fully audited
-versions — old versions are kept, never overwritten, and a watermark
-regression can never un-emit them. All recomputation is idempotent: identical
-content never yields a new version, so replays and restarts cannot
-double-count.
+simply keeps waiting (never dropped, never force-closed one-sided by an idle
+stream), and a business whose both sides have arrived is never stuck behind
+a silent stream. Late events and retractions recompute already-emitted windows
+and produce new, fully audited versions — old versions are kept, never
+overwritten, and a watermark regression can never un-emit them. All
+recomputation is idempotent: identical content never yields a new version, so
+replays and restarts cannot double-count.
 
 Every emitted version is also fanned out to registered downstreams via a
 transactional outbox: the delivery rows are inserted in the same transaction
@@ -433,8 +434,35 @@ def key_max_event_times(cur, key=None):
     return out
 
 
-def emission_marks(wms, key_max, key):
-    """Per-stream crossing evidence for one business key (core.side_evidence)."""
+def effective_data_sides(cur, key=None):
+    """{(key, window_start): {streams}} — which sides have at least one
+    effective (non-retracted) upsert in that window. This is the "has data
+    on this side in this window" fact the idle-finalization rule uses: an
+    idle stream may only finalize a side that already has data."""
+    sql = """SELECT e.key, (e.event_time / %s) * %s AS ws, e.stream
+             FROM stream_events e
+             WHERE e.type = 'upsert'
+               AND NOT EXISTS (
+                   SELECT 1 FROM stream_events r
+                   WHERE r.type = 'retract' AND r.stream = e.stream
+                         AND r.retracts = e.event_id
+               )"""
+    args = [WINDOW_MS, WINDOW_MS]
+    if key is not None:
+        sql += " AND e.key = %s"
+        args.append(key)
+    sql += " GROUP BY e.key, ws, e.stream"
+    cur.execute(sql, args)
+    sides = {}
+    for k, ws, stream in cur.fetchall():
+        sides.setdefault((k, ws), set()).add(stream)
+    return sides
+
+
+def emission_marks(wms, key_max, sides, key, ws):
+    """Per-stream crossing evidence for one (key, window)
+    (core.side_evidence)."""
+    present = sides.get((key, ws), ())
     marks = {}
     for stream in INGESTS:
         info = wms.get(stream) or {}
@@ -442,6 +470,7 @@ def emission_marks(wms, key_max, key):
             "watermark": info.get("watermark"),
             "source": info.get("source"),
             "key_max_event_time": key_max.get(key, {}).get(stream),
+            "key_has_data_in_window": stream in present,
         }
     return marks
 
@@ -453,23 +482,19 @@ def close_windows(conn):
     The gate is per business key: one quiet business cannot stall the
     others; a slow business simply keeps waiting — its events and the
     absence of a result are the waiting state, re-evaluated every tick,
-    never dropped; and an idle stream's wall-clock watermark never
-    finalizes a business still waiting for that side. Already-emitted
+    never dropped; an idle stream's wall-clock watermark never finalizes
+    a side that has no data in the window, but a window whose both sides
+    have arrived is finalized once the streams go idle. Already-emitted
     results are never revisited here, so a watermark regression cannot
     un-emit them.
     """
     with conn.cursor() as cur:
         wms = current_watermarks(cur)
         key_max = key_max_event_times(cur)
-        cur.execute(
-            """SELECT DISTINCT key, (event_time / %s) * %s AS ws
-               FROM stream_events WHERE type = 'upsert'""",
-            (WINDOW_MS, WINDOW_MS),
-        )
-        candidates = cur.fetchall()
-    for key, ws in candidates:
+        sides = effective_data_sides(cur)
+    for key, ws in sides:
         end = ws + WINDOW_MS
-        marks = emission_marks(wms, key_max, key)
+        marks = emission_marks(wms, key_max, sides, key, ws)
         if not window_ready(marks["a"], marks["b"], end):
             continue
         with conn.cursor() as cur:
@@ -517,9 +542,10 @@ def order_window_gaps(cur, key, bound):
     the same per-key gate that drives emission."""
     wms = current_watermarks(cur)
     key_max = key_max_event_times(cur, key)
+    sides = effective_data_sides(cur, key)
     missing, pending = [], []
     for ws in business_windows(cur, key) - bound:
-        marks = emission_marks(wms, key_max, key)
+        marks = emission_marks(wms, key_max, sides, key, ws)
         due = window_ready(marks["a"], marks["b"], ws + WINDOW_MS)
         (missing if due else pending).append(ws)
     return sorted(missing), sorted(pending)
@@ -929,6 +955,7 @@ def windows():
             with conn.cursor() as cur:
                 wms = current_watermarks(cur)
                 key_max = key_max_event_times(cur)
+                sides = effective_data_sides(cur)
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     """SELECT key, (event_time / %s) * %s AS window_start,
@@ -951,7 +978,7 @@ def windows():
     out = []
     for r in rows:
         ws = r["window_start"]
-        marks = emission_marks(wms, key_max, r["key"])
+        marks = emission_marks(wms, key_max, sides, r["key"], ws)
         head = heads.get((ws, r["key"]))
         out.append({
             "window_start": ws,

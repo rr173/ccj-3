@@ -83,12 +83,12 @@ curl -sf "$R/results/current?window_start=$WS&key=order-1" | field "d['result'][
 say "6. WHY did the result change? full history + audit"
 curl -sf "$R/results/history?window_start=$WS&key=order-1" | json
 
-say "7. idle stream: watermark advances by wall clock, but must NOT close waiting businesses"
+say "7. idle stream: wall-clock watermark finalizes only sides that already have data"
 echo "waiting ~25s for the 20s idle timeout..."
 sleep 25
 echo "watermark source flips to idle_timeout:"
 curl -sf "$A/watermark" | json
-echo "the __hb__ window is still NOT closed — an idle watermark is not a promise:"
+echo "the __hb__ window's end is still ahead of the idle watermark — not closed yet:"
 curl -sf "$R/windows" | field "[w for w in d['windows'] if w['key']=='__hb__']" | json
 
 say "8. watermark regression (operator dials stream A back)"

@@ -167,9 +167,11 @@ def get_watermark():
     """Current watermark for this stream.
 
     watermark = max_event_time - grace, advanced by wall clock when the stream
-    has been idle past IDLE_TIMEOUT_MS (so one quiet side cannot stall
-    alignment forever). An operator override, when set, wins outright — this
-    is also how a deliberate watermark regression is applied.
+    has been idle past IDLE_TIMEOUT_MS. The aligner treats an idle watermark
+    as finalization evidence only for sides that already have data in the
+    window — never for sides a business is still waiting for. An operator
+    override, when set, wins outright — this is also how a deliberate
+    watermark regression is applied.
     """
     conn = connect()
     try:

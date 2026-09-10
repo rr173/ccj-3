@@ -128,12 +128,13 @@ class TestDeliveryKind(unittest.TestCase):
 
 
 class TestSideEvidence(unittest.TestCase):
-    """Per-(key, stream) crossing evidence for the per-key emission gate."""
+    """Per-(key, stream, window) crossing evidence for the emission gate."""
     END = 60_000
 
-    def mark(self, watermark=None, source=None, key_max=None):
+    def mark(self, watermark=None, source=None, key_max=None, has_data=False):
         return {"watermark": watermark, "source": source,
-                "key_max_event_time": key_max}
+                "key_max_event_time": key_max,
+                "key_has_data_in_window": has_data}
 
     def test_own_progress_crosses_without_any_watermark(self):
         # the key itself has an event beyond the window end: it has moved on
@@ -155,11 +156,23 @@ class TestSideEvidence(unittest.TestCase):
         self.assertEqual(side_evidence(self.mark(self.END, "override"), self.END),
                          "watermark")
 
-    def test_idle_watermark_never_crosses(self):
-        # idle wall-clock advance is not a promise: it must not finalize
-        # businesses still waiting for this side, no matter how far it goes
+    def test_idle_watermark_crosses_a_side_that_has_data(self):
+        # both-sides-arrived businesses must not be stuck behind a silent
+        # stream: idleness finalizes a side that already has data
+        self.assertEqual(
+            side_evidence(self.mark(self.END, "idle_timeout", has_data=True),
+                          self.END),
+            "idle_finalized")
+
+    def test_idle_watermark_never_crosses_an_empty_side(self):
+        # a side the business is still waiting for is NOT crossed by idle
+        # wall-clock advance, no matter how far it goes
         self.assertIsNone(side_evidence(self.mark(100 * self.END, "idle_timeout"),
                                         self.END))
+
+    def test_idle_with_data_still_needs_the_watermark_to_reach_the_end(self):
+        self.assertIsNone(side_evidence(
+            self.mark(self.END - 1, "idle_timeout", has_data=True), self.END))
 
     def test_no_data_does_not_cross(self):
         self.assertIsNone(side_evidence(self.mark(None, "no_data"), self.END))
@@ -177,9 +190,10 @@ class TestSideEvidence(unittest.TestCase):
 class TestWindowReady(unittest.TestCase):
     END = 60_000
 
-    def mark(self, watermark=None, source=None, key_max=None):
+    def mark(self, watermark=None, source=None, key_max=None, has_data=False):
         return {"watermark": watermark, "source": source,
-                "key_max_event_time": key_max}
+                "key_max_event_time": key_max,
+                "key_has_data_in_window": has_data}
 
     def test_ready_only_when_both_sides_cross(self):
         a = self.mark(key_max=self.END)
@@ -199,6 +213,16 @@ class TestWindowReady(unittest.TestCase):
         a = self.mark(key_max=self.END)                    # own progress
         b = self.mark(self.END, "event_time")              # stream promise
         self.assertTrue(window_ready(a, b, self.END))
+
+    def test_both_sides_with_data_close_once_streams_go_idle(self):
+        a = self.mark(self.END, "idle_timeout", has_data=True)
+        b = self.mark(self.END, "idle_timeout", has_data=True)
+        self.assertTrue(window_ready(a, b, self.END))
+
+    def test_one_sided_business_keeps_waiting_when_streams_go_idle(self):
+        a = self.mark(self.END, "idle_timeout", has_data=True)
+        b = self.mark(self.END, "idle_timeout")            # no data on this side
+        self.assertFalse(window_ready(a, b, self.END))
 
 
 class TestRetryDelay(unittest.TestCase):

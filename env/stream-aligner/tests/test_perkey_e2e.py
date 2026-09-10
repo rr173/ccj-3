@@ -8,8 +8,9 @@ Covers the per-business-key emission gate:
   waiting for the stream-wide watermark (its own newer events are enough);
 - a business that never gets new events neither blocks others nor gets
   dropped — it simply keeps waiting;
-- an idle stream's wall-clock watermark must NOT finalize businesses still
-  waiting (idle_timeout is not crossing evidence);
+- once the streams go idle, a window whose both sides have arrived IS
+  finalized (idle wall-clock must not strand complete businesses), while a
+  business still missing a side is NOT (idle must not force-close it);
 - once the stream genuinely promises again (event-time watermark), the
   waiting business emits — even one-sided;
 - a watermark regression never un-emits results that already went out.
@@ -80,16 +81,20 @@ def main():
     ws = now // W * W
     busy = f"pk-busy-{now}"   # keeps producing on both sides
     slow = f"pk-slow-{now}"   # one A-side event, then silence forever
+    done = f"pk-done-{now}"   # both sides arrive in window ws, then silence
 
     # -- a quiet business cannot stall a flowing one --------------------------
     # busy has events in window ws AND beyond its end on both sides: its own
     # progress crosses the window end even though neither stream watermark
-    # has reached it. slow only has one A-side event in window ws.
+    # has reached it. slow only has one A-side event in window ws. done has
+    # both sides in window ws but nothing beyond it.
     post(A, "/events", {"events": [ev(f"{busy}-a1", ws + 1000, busy),
                                    ev(f"{busy}-a2", ws + W + 1000, busy),
-                                   ev(f"{slow}-a1", ws + 1000, slow)]})
+                                   ev(f"{slow}-a1", ws + 1000, slow),
+                                   ev(f"{done}-a1", ws + 1000, done)]})
     post(B, "/events", {"events": [ev(f"{busy}-b1", ws + 1500, busy),
-                                   ev(f"{busy}-b2", ws + W + 1500, busy)]})
+                                   ev(f"{busy}-b2", ws + W + 1500, busy),
+                                   ev(f"{done}-b1", ws + 1500, done)]})
 
     v1 = wait_for("busy key emits on its own progress, watermark still short",
                   lambda: head(ws, busy))
@@ -112,38 +117,49 @@ def main():
     time.sleep(3)  # let several ticks run — nothing more may happen
     check("slow key keeps waiting (its B side never crossed), not dropped",
           head(ws, slow) is None)
+    check("done key waits while streams are live and the watermark is short",
+          head(ws, done) is None)
     check("busy's next window waits too (nothing crosses its end yet)",
           head(ws + W, busy) is None)
 
-    # -- an idle stream must not finalize businesses still waiting ------------
+    # -- once idle: complete businesses finalize, waiting ones do not ---------
     def both_idle():
         src = get(R, "/watermarks")["sources"]
         return src.get("a") == "idle_timeout" and src.get("b") == "idle_timeout"
 
     wait_for("both streams go idle (wall-clock watermark)", both_idle, timeout=60)
-    time.sleep(3)  # several aligner ticks with idle watermarks in effect
+    v2 = wait_for("both-sides-arrived business emits once streams go idle",
+                  lambda: head(ws, done), timeout=60)
+    if v2:
+        pairs = [(p["a_event_id"], p["b_event_id"]) for p in v2["payload"]["pairs"]]
+        check("done key's pairs are complete",
+              pairs == [(f"{done}-a1", f"{done}-b1")], str(pairs))
+    audit = get(R, "/audit", window_start=ws, key=done)["audit"]
+    check("done key's crossing evidence is idle_finalized on both sides",
+          audit and audit[0]["reason"] == "INITIAL"
+          and audit[0]["detail"]["side_a"] == "idle_finalized"
+          and audit[0]["detail"]["side_b"] == "idle_finalized",
+          str(audit[:1]))
     check("idle watermark did NOT close the still-waiting slow key",
           head(ws, slow) is None)
-    check("idle watermark did NOT close busy's next window either",
-          head(ws + W, busy) is None)
 
     # -- recovery: real stream progress emits the waiting businesses ----------
     post(A, "/events", ev(f"{busy}-a3", ws + 2 * W + 1000, busy))
     post(B, "/events", ev(f"{busy}-b3", ws + 2 * W + 1000, busy))
 
-    v2 = wait_for("busy's second window emits once its own progress crosses",
+    v3 = wait_for("busy's second window emits once its own progress crosses",
                   lambda: head(ws + W, busy))
-    if v2:
-        pairs = [(p["a_event_id"], p["b_event_id"]) for p in v2["payload"]["pairs"]]
+    if v3:
+        pairs = [(p["a_event_id"], p["b_event_id"]) for p in v3["payload"]["pairs"]]
         check("second window pairs its own events",
               pairs == [(f"{busy}-a2", f"{busy}-b2")], str(pairs))
-    v3 = wait_for("slow key finally emits once the stream watermark promises",
+    v4 = wait_for("slow key finally emits once the stream watermark promises",
                   lambda: head(ws, slow))
-    if v3:
+    if v4:
         check("slow key's result is one-sided with the A event unmatched",
-              v3["payload"]["match_count"] == 0
-              and v3["payload"]["unmatched_a"] == [f"{slow}-a1"]
-              and v3["payload"]["unmatched_b"] == [], str(v3["payload"]))
+              v4["payload"]["match_count"] == 0
+              and v4["payload"]["unmatched_a"] == [f"{slow}-a1"]
+              and v4["payload"]["unmatched_b"] == [], str(v4["payload"]))
 
     # -- watermark regression must not un-emit anything -----------------------
     post(A, "/watermark/override", {"watermark": ws})  # dial A way back
@@ -154,7 +170,8 @@ def main():
     check("emitted results survive the regression untouched",
           (head(ws, busy) or {}).get("version") == 1
           and (head(ws + W, busy) or {}).get("version") == 1
-          and (head(ws, slow) or {}).get("version") == 1)
+          and (head(ws, slow) or {}).get("version") == 1
+          and (head(ws, done) or {}).get("version") == 1)
     post(A, "/watermark/override", {"watermark": None})
 
     print()

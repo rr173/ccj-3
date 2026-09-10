@@ -128,30 +128,41 @@ def decide(head, new_payload):
 
 # Watermark sources that count as a real progress promise. An idle-timeout
 # watermark is wall-clock guesswork about a silent stream, not a promise —
-# it must never finalize businesses still waiting for that side.
+# on its own it must never finalize a side the business is still waiting for.
 CROSSING_SOURCES = ("event_time", "override")
 
 
 def side_evidence(mark, window_end):
     """Why one stream counts as past ``window_end`` for one key, or None.
 
-    ``mark`` — {"watermark", "source", "key_max_event_time"} for one
-    (stream, key). Two kinds of crossing evidence, either sufficient:
+    ``mark`` — {"watermark", "source", "key_max_event_time",
+    "key_has_data_in_window"} for one (stream, key, window). Three kinds of
+    crossing evidence, any sufficient:
 
     - ``own_progress``: the key itself has an event on this stream at or
       beyond the window end — the business has moved on by itself, no need
       to wait for the rest of the stream;
     - ``watermark``: the stream watermark covers the window end AND comes
       from a real promise (event data or an operator override) — not from
-      idle wall-clock advancement.
+      idle wall-clock advancement;
+    - ``idle_finalized``: the stream has gone idle (wall-clock watermark
+      covers the window end) AND the key already has effective data on
+      this side *in this window*. A business whose both sides have arrived
+      must not be stuck forever behind a silent stream. A side with no
+      data in the window is NOT crossed by idleness — a business still
+      waiting for it keeps waiting, never force-closed one-sided.
     """
     key_max = mark.get("key_max_event_time")
     if key_max is not None and key_max >= window_end:
         return "own_progress"
     watermark = mark.get("watermark")
-    if (watermark is not None and watermark >= window_end
-            and mark.get("source") in CROSSING_SOURCES):
+    if watermark is None or watermark < window_end:
+        return None
+    source = mark.get("source")
+    if source in CROSSING_SOURCES:
         return "watermark"
+    if source == "idle_timeout" and mark.get("key_has_data_in_window"):
+        return "idle_finalized"
     return None
 
 
