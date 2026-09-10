@@ -198,6 +198,55 @@ def decide(head, new_payload):
 
 
 # ---------------------------------------------------------------------------
+# Downstream posting ledger (下游入账台账), per (subscriber, window, key).
+#
+# Delivery being at-least-once, "we sent it" never means "it is booked": the
+# downstream itself reports which version of a result it has posted (入账),
+# and the ledger compares that against the last version we confirmed
+# DELIVERED. A pair enters the ledger at its first accepted report; pairs the
+# downstream never reported on keep flowing exactly as before (no gate).
+# ---------------------------------------------------------------------------
+
+POSTING_STATUSES = ("ALIGNED", "LAGGING", "AHEAD_UNCONFIRMED")
+
+
+def posting_status(reported_version, delivered_up_to):
+    """Alignment between what the downstream says it posted and what we
+    confirmed delivered, for one (downstream, result) pair.
+
+    ``reported_version`` — the version the downstream last reported as posted
+    (None/0 = it has not reported anything);
+    ``delivered_up_to``  — the highest version we confirmed DELIVERED to it
+    (None/0 = nothing delivered yet).
+
+    - ``ALIGNED``           — reported == delivered: the books balance;
+    - ``LAGGING``           — reported < delivered: it is behind. Later
+                              versions of THIS result are held for THIS
+                              downstream until it reports catching up;
+    - ``AHEAD_UNCONFIRMED`` — reported > delivered: it claims a version whose
+                              delivery we have not confirmed yet (the row is
+                              still PENDING/RETRYING — a lost response leaves
+                              us retrying what it already posted). Nothing is
+                              held: our own retry is what closes the gap.
+    """
+    reported = reported_version or 0
+    delivered = delivered_up_to or 0
+    if reported == delivered:
+        return "ALIGNED"
+    if reported < delivered:
+        return "LAGGING"
+    return "AHEAD_UNCONFIRMED"
+
+
+def posting_gate_allows(status):
+    """Whether further versions of a result may be dispatched to a downstream
+    whose ledger status is ``status``. Only LAGGING holds the gate: while it
+    is behind, later versions of that one result wait for its posting to
+    catch up; other results of the same downstream are never affected."""
+    return status != "LAGGING"
+
+
+# ---------------------------------------------------------------------------
 # Per-key emission gate (按业务键分开关窗).
 #
 # A result for (window, key) is emitted only when *that key's own two sides*

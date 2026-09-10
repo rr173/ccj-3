@@ -173,6 +173,47 @@ echo "subscription backlog counters:"
 curl -sf "$R/subscriptions" | json
 
 # ---------------------------------------------------------------------------
+# downstream posting ledger: delivered != booked — the downstream reports
+# which version it actually posted, and the ledger gates per result
+# ---------------------------------------------------------------------------
+say "10b. posting ledger: the downstream itself reports what it booked"
+echo "demo-sink reports it posted order-1@WS only up to v1, while v4 is delivered:"
+post "$R/postings" "{\"subscriber_name\":\"demo-sink\",\"window_start\":$WS,\"key\":\"order-1\",\"version\":1}" | json
+echo "-> reported 1, delivered 4 = LAGGING:"
+curl -sf "$R/postings?subscriber=demo-sink&key=order-1" \
+  | field "[(p['key'], p['reported_version'], p['delivered_up_to'], p['status'], p['gated']) for p in d['postings']]"
+echo "it catches up by reporting v4 -> ALIGNED:"
+post "$R/postings" "{\"subscriber_name\":\"demo-sink\",\"window_start\":$WS,\"key\":\"order-1\",\"version\":4}" | json
+
+say "10c. a new delivery on the aligned pair turns it LAGGING and holds later versions"
+post "$B/events" '{"event_id":"b5-post","event_time":'"$((WS+900))"',"key":"order-1","payload":{"ship":"knocks-lagging"}}' >/dev/null
+wait_version "$WS" order-1 5
+sleep 3
+echo "v5 delivered -> the pair is LAGGING again (reported 4, delivered 5):"
+curl -sf "$R/postings?subscriber=demo-sink&key=order-1" \
+  | field "[(p['reported_version'], p['delivered_up_to'], p['status'], p['gated']) for p in d['postings']]"
+post "$B/events" '{"event_id":"b6-post","event_time":'"$((WS+1000))"',"key":"order-1","payload":{"ship":"held-while-lagging"}}' >/dev/null
+wait_version "$WS" order-1 6
+sleep 3
+echo "v6 computed but HELD while the pair lags — still PENDING in the outbox:"
+curl -sf "$R/deliveries?window_start=$WS&key=order-1&status=PENDING" \
+  | field "[(d['version'], d['kind'], d['status']) for d in d['deliveries']]"
+echo "reporting a version we never sent (v99) is rejected and does not count:"
+curl -s -o /dev/null -w '  http status: %{http_code}\n' -X POST "$R/postings" \
+  -H 'Content-Type: application/json' \
+  -d "{\"subscriber_name\":\"demo-sink\",\"window_start\":$WS,\"key\":\"order-1\",\"version\":99}"
+echo "it reports catching up to v5 -> gate lifts -> held v6 flows:"
+post "$R/postings" "{\"subscriber_name\":\"demo-sink\",\"window_start\":$WS,\"key\":\"order-1\",\"version\":5}" | json
+sleep 3
+curl -sf "$R/postings?subscriber=demo-sink&key=order-1" \
+  | field "[(p['reported_version'], p['delivered_up_to'], p['status']) for p in d['postings']]"
+post "$R/postings" "{\"subscriber_name\":\"demo-sink\",\"window_start\":$WS,\"key\":\"order-1\",\"version\":6}" | json
+
+say "10d. the ledger trail: when it flipped aligned->lagging, and which version did it"
+curl -sf "$R/postings/history?subscriber=demo-sink&window_start=$WS&key=order-1" \
+  | field "[(e['event'], e['cause_version'], e['prev_status'], e['status']) for e in d['events']]"
+
+# ---------------------------------------------------------------------------
 # business orders: one business key spanning two windows, full lifecycle
 # ---------------------------------------------------------------------------
 say "11. business orders: one key across two windows (open -> waiting -> closed)"

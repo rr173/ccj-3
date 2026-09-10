@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "services", "al
 
 from app.core import (compute_payload, decide, delivery_kind, effective,  # noqa: E402
                       normalize_backfill_range, payload_hash,
+                      posting_gate_allows, posting_status,
                       released_version_kind, releasable, retry_delay_ms,
                       should_deliver, side_evidence, window_of, window_ready)
 
@@ -293,6 +294,37 @@ class TestRetryDelay(unittest.TestCase):
     def test_capped_at_max(self):
         self.assertEqual(retry_delay_ms(100, 1000, 60000), 60000)
         self.assertEqual(retry_delay_ms(1, 5000, 3000), 3000)
+
+
+class TestPostingStatus(unittest.TestCase):
+    """The downstream posting ledger: reported (入账) vs delivered."""
+
+    def test_aligned_when_reported_matches_delivered(self):
+        self.assertEqual(posting_status(3, 3), "ALIGNED")
+
+    def test_lagging_when_delivery_passed_the_report(self):
+        # aligned at v1, then v2 was delivered -> lagging
+        self.assertEqual(posting_status(1, 2), "LAGGING")
+
+    def test_ahead_when_it_posted_a_version_we_still_retry(self):
+        # downstream claims v3 while our v3 delivery is unconfirmed
+        self.assertEqual(posting_status(3, 2), "AHEAD_UNCONFIRMED")
+
+    def test_report_before_any_delivery_is_ahead_unconfirmed(self):
+        self.assertEqual(posting_status(1, None), "AHEAD_UNCONFIRMED")
+
+    def test_nothing_on_either_side_is_trivially_aligned(self):
+        self.assertEqual(posting_status(None, None), "ALIGNED")
+        self.assertEqual(posting_status(0, 0), "ALIGNED")
+
+    def test_rollback_report_turns_the_pair_lagging(self):
+        # it says it rolled back to v1 while v3 is delivered -> lagging
+        self.assertEqual(posting_status(1, 3), "LAGGING")
+
+    def test_gate_holds_only_when_lagging(self):
+        self.assertFalse(posting_gate_allows("LAGGING"))
+        self.assertTrue(posting_gate_allows("ALIGNED"))
+        self.assertTrue(posting_gate_allows("AHEAD_UNCONFIRMED"))
 
 
 class TestNormalizeBackfillRange(unittest.TestCase):

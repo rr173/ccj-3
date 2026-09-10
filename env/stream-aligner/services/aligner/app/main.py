@@ -45,6 +45,18 @@ so the two channels cannot deadlock. A replay job can be paused and later
 resumed, and the outbox identity prevents the same subscriber/version from
 being replayed twice. Replay ranges speak event time and are snapped to window
 boundaries, so a bound landing mid-window never drops the window containing it.
+
+On top of delivery sits the downstream posting ledger (下游入账台账): a
+delivered version is only "booked" once the downstream itself reports it
+posted. Per (downstream, result) the ledger tracks reported_version against
+delivered_up_to — ALIGNED, LAGGING, or AHEAD_UNCONFIRMED (it posted a version
+we are still retrying). A new delivery on an aligned pair turns it LAGGING
+and holds that result's later versions for that downstream until its posting
+catches up; other results keep flowing. Reports naming a version never sent
+to that downstream are rejected (and traced); rollback reports move the
+ledger back without erasing delivery records. Every report and every
+delivery advance appends an immutable event, so the moment and the version
+that flipped a pair from aligned to lagging is always queryable.
 """
 import json
 import logging
@@ -61,9 +73,9 @@ import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app.core import (ORDER_STATUSES, build_order_snapshot, compute_payload,
-                      decide, delivery_kind, evaluate_order,
-                      normalize_backfill_range, order_reason,
+from app.core import (ORDER_STATUSES, POSTING_STATUSES, build_order_snapshot,
+                      compute_payload, decide, delivery_kind, evaluate_order,
+                      normalize_backfill_range, order_reason, posting_status,
                       released_version_kind, retry_delay_ms, should_deliver,
                       side_evidence, window_of, window_ready)
 
@@ -335,6 +347,57 @@ SELECT d.window_start,
 FROM deliveries d
 GROUP BY d.window_start, d.key
 ON CONFLICT (window_start, key) DO NOTHING;
+-- ---------------------------------------------------------------------------
+-- Downstream posting ledger (下游入账台账), per (subscriber, window, key).
+--
+-- "We delivered it" never means "it booked it": the downstream itself reports
+-- the version it has posted, and the ledger holds the comparison —
+-- reported_version (它报到哪一版) against delivered_up_to (我送到哪一版):
+-- ALIGNED (对齐) / LAGGING (落后) / AHEAD_UNCONFIRMED (它对上了一个我们还在
+-- 重试的版本). A pair enters the ledger at its first accepted report; pairs
+-- never reported on keep flowing exactly as before — the flow-control gate
+-- only ever engages on a pair the downstream itself started reporting.
+--
+-- posting_ledger is the current head; posting_events is the append-only
+-- trail: every report (accepted AND rejected) and every delivery advance
+-- lands one row carrying the state before and after, so the moment a pair
+-- flipped from ALIGNED to LAGGING — and which version knocked it there — is
+-- never overwritten by later states. Rows are keyed by subscriber_id, so
+-- re-registering a downstream under a new URL keeps the ledger attached to
+-- the same downstream.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS posting_ledger (
+    subscriber_id     BIGINT NOT NULL REFERENCES subscribers(id),
+    window_start      BIGINT NOT NULL,
+    key               TEXT NOT NULL,
+    reported_version  INT NOT NULL,            -- last version it reported posted
+    delivered_up_to   INT,                     -- max version confirmed DELIVERED (NULL = none yet)
+    status            TEXT NOT NULL CHECK (status IN ('ALIGNED', 'LAGGING', 'AHEAD_UNCONFIRMED')),
+    first_reported_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (subscriber_id, window_start, key)
+);
+CREATE TABLE IF NOT EXISTS posting_events (
+    id               BIGSERIAL PRIMARY KEY,
+    subscriber_id    BIGINT NOT NULL REFERENCES subscribers(id),
+    window_start     BIGINT NOT NULL,
+    key              TEXT NOT NULL,
+    event            TEXT NOT NULL CHECK (event IN
+                     ('REPORT_ACCEPTED', 'REPORT_REJECTED', 'DELIVERY_ADVANCED')),
+    cause_version    INT NOT NULL,             -- the version reported / delivered
+    prev_reported    INT,
+    prev_delivered   INT,
+    prev_status      TEXT CHECK (prev_status IN ('ALIGNED', 'LAGGING', 'AHEAD_UNCONFIRMED')),
+    reported_version INT,                      -- ledger state after this event
+    delivered_up_to  INT,
+    status           TEXT CHECK (status IN ('ALIGNED', 'LAGGING', 'AHEAD_UNCONFIRMED')),
+    detail           JSONB,                    -- e.g. the rejection reason
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS posting_events_pair_idx
+    ON posting_events (subscriber_id, window_start, key, id);
+CREATE INDEX IF NOT EXISTS posting_events_subscriber_idx
+    ON posting_events (subscriber_id, id);
 """
 
 
@@ -1206,6 +1269,154 @@ def complete_finished_backfill_jobs(cur):
 
 
 # ---------------------------------------------------------------------------
+# downstream posting ledger (下游入账台账)
+# ---------------------------------------------------------------------------
+# The ledger is fed from two sides, always in the writer's own transaction:
+#
+# - a successful delivery advances delivered_up_to (advance_posting_ledger,
+#   called from deliver_one). If the pair was ALIGNED, the new delivery turns
+#   it LAGGING right there — the DELIVERY_ADVANCED event records which
+#   version knocked it lagging;
+# - a downstream report (POST /postings) moves reported_version — up as it
+#   catches up, DOWN when it says it rolled back (the ledger regresses with
+#   it; delivery rows are never touched). A report naming a version that was
+#   never delivered to this downstream is rejected: it changes nothing, but
+#   the rejection itself is traced as REPORT_REJECTED.
+#
+# While a pair is LAGGING the dispatcher holds that result's later versions
+# for that downstream (see the NOT EXISTS gate in DUE_SQL /
+# BACKFILL_DUE_SQL); every other result of the same downstream flows on.
+
+def record_posting_event(cur, subscriber_id, window_start, key, event,
+                         cause_version, prev, new, detail=None):
+    """Append one posting-ledger event. ``prev``/``new`` are
+    (reported_version, delivered_up_to, status) triples; ``prev`` is None
+    when the pair had no ledger row before this event."""
+    cur.execute(
+        """INSERT INTO posting_events
+               (subscriber_id, window_start, key, event, cause_version,
+                prev_reported, prev_delivered, prev_status,
+                reported_version, delivered_up_to, status, detail)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+        (subscriber_id, window_start, key, event, cause_version,
+         prev[0] if prev else None, prev[1] if prev else None,
+         prev[2] if prev else None, new[0], new[1], new[2],
+         psycopg2.extras.Json(detail) if detail is not None else None),
+    )
+
+
+def advance_posting_ledger(cur, delivery):
+    """Fold one successful delivery into the posting ledger.
+
+    Runs inside deliver_one's transaction, which already holds the
+    subscriber row lock — so a concurrent first report for the same
+    subscriber cannot seed the ledger from a stale delivered watermark.
+    Pairs the downstream never reported on are untracked: there is nothing
+    to knock lagging, and their flow is exactly the pre-ledger behaviour.
+    """
+    cur.execute(
+        """SELECT reported_version, delivered_up_to, status FROM posting_ledger
+           WHERE subscriber_id = %s AND window_start = %s AND key = %s
+           FOR UPDATE""",
+        (delivery["subscriber_id"], delivery["window_start"], delivery["key"]),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return
+    reported, delivered, prev_status = row
+    if delivered is not None and delivery["version"] <= delivered:
+        return  # non-advancing (a redelivery of an older version): no change
+    new = (reported, delivery["version"],
+           posting_status(reported, delivery["version"]))
+    cur.execute(
+        """UPDATE posting_ledger
+           SET delivered_up_to = %s, status = %s, updated_at = now()
+           WHERE subscriber_id = %s AND window_start = %s AND key = %s""",
+        (new[1], new[2], delivery["subscriber_id"],
+         delivery["window_start"], delivery["key"]),
+    )
+    record_posting_event(cur, delivery["subscriber_id"], delivery["window_start"],
+                         delivery["key"], "DELIVERY_ADVANCED", delivery["version"],
+                         (reported, delivered, prev_status), new)
+
+
+def report_posting(conn, subscriber_id, window_start, key, version):
+    """Apply one downstream posting report; returns the resulting ledger row.
+
+    The reported version must be one we actually put in this downstream's
+    outbox — a version we never sent it cannot have been posted by it, so
+    the report is rejected (the caller answers 409) and the rejection is
+    traced. Reports may move the posted position backwards (the downstream
+    rolled its books back): the ledger regresses accordingly while every
+    delivery row stays put. Both the ledger write and its event commit in
+    one transaction.
+    """
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        # Serialize against a concurrent delivery advancing the same
+        # subscriber's ledger (deliver_one locks the subscriber row too).
+        cur.execute("SELECT 1 FROM subscribers WHERE id = %s FOR UPDATE",
+                    (subscriber_id,))
+        cur.execute(
+            """SELECT 1 FROM deliveries
+               WHERE subscriber_id = %s AND window_start = %s
+                 AND key = %s AND version = %s""",
+            (subscriber_id, window_start, key, version),
+        )
+        ever_sent = cur.fetchone() is not None
+        cur.execute(
+            """SELECT reported_version, delivered_up_to, status FROM posting_ledger
+               WHERE subscriber_id = %s AND window_start = %s AND key = %s
+               FOR UPDATE""",
+            (subscriber_id, window_start, key),
+        )
+        row = cur.fetchone()
+        prev = ((row["reported_version"], row["delivered_up_to"], row["status"])
+                if row else None)
+        if not ever_sent:
+            # A version this downstream never got from us: the report cannot
+            # count. Trace the rejection, change nothing.
+            record_posting_event(
+                cur, subscriber_id, window_start, key, "REPORT_REJECTED",
+                version, prev, prev or (None, None, None),
+                {"reason": "version_never_sent_to_subscriber"})
+            return None
+        if row is None:
+            # First report for this pair: seed delivered_up_to from the
+            # outbox as it stands now (the subscriber lock above makes this
+            # read race-free against concurrent deliveries).
+            cur.execute(
+                """SELECT MAX(version) AS d FROM deliveries
+                   WHERE subscriber_id = %s AND window_start = %s
+                     AND key = %s AND status = 'DELIVERED'""",
+                (subscriber_id, window_start, key),
+            )
+            delivered = cur.fetchone()["d"]
+            status = posting_status(version, delivered)
+            cur.execute(
+                """INSERT INTO posting_ledger
+                       (subscriber_id, window_start, key,
+                        reported_version, delivered_up_to, status)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (subscriber_id, window_start, key, version, delivered, status),
+            )
+        else:
+            delivered = row["delivered_up_to"]
+            status = posting_status(version, delivered)
+            cur.execute(
+                """UPDATE posting_ledger
+                   SET reported_version = %s, status = %s, updated_at = now()
+                   WHERE subscriber_id = %s AND window_start = %s AND key = %s""",
+                (version, status, subscriber_id, window_start, key),
+            )
+        new = (version, delivered, status)
+        record_posting_event(cur, subscriber_id, window_start, key,
+                             "REPORT_ACCEPTED", version, prev, new)
+        return {"subscriber_id": subscriber_id, "window_start": window_start,
+                "key": key, "reported_version": version,
+                "delivered_up_to": delivered, "status": status}
+
+
+# ---------------------------------------------------------------------------
 # delivery dispatcher (transactional outbox)
 # ---------------------------------------------------------------------------
 
@@ -1242,6 +1453,17 @@ WHERE s.active
         AND p.version < d.version
         AND p.status <> 'DELIVERED'
   )
+  AND NOT EXISTS (
+      -- posting-ledger flow control: this downstream's posted position lags
+      -- what we already delivered for THIS result — hold its later versions
+      -- until it reports catching up. Scoped to one (window, key): other
+      -- results of the same downstream are never held back by this one.
+      SELECT 1 FROM posting_ledger pl
+      WHERE pl.subscriber_id = d.subscriber_id
+        AND pl.window_start = d.window_start
+        AND pl.key = d.key
+        AND pl.status = 'LAGGING'
+  )
 ORDER BY d.id
 LIMIT %s
 """
@@ -1270,6 +1492,16 @@ WHERE s.active
         AND p.key = d.key
         AND p.version < d.version
         AND p.status <> 'DELIVERED'
+  )
+  AND NOT EXISTS (
+      -- the posting-ledger gate applies to replays exactly as to live
+      -- traffic: a downstream behind on posting this result gets no further
+      -- versions of it, whichever channel they ride
+      SELECT 1 FROM posting_ledger pl
+      WHERE pl.subscriber_id = d.subscriber_id
+        AND pl.window_start = d.window_start
+        AND pl.key = d.key
+        AND pl.status = 'LAGGING'
   )
 ORDER BY d.id
 LIMIT %s
@@ -1323,6 +1555,12 @@ def deliver_one(conn, row):
                WHERE id = %s""",
             (attempts, row["id"]),
         )
+        # Lock the subscriber row before touching the ledger: a concurrent
+        # first report for this subscriber seeds its ledger row under the
+        # same lock, so the two can never miss each other's write.
+        cur.execute("SELECT 1 FROM subscribers WHERE id = %s FOR UPDATE",
+                    (row["subscriber_id"],))
+        advance_posting_ledger(cur, row)
     log.info("delivery %d (%s %s v%d) to %s ok (attempt %d)",
              row["id"], row["kind"], row["key"], row["version"],
              row["subscriber"], attempts)
@@ -2164,3 +2402,170 @@ def result_delivery(window_start: int, key: str):
             "released_version": released["result_version"] if released else None,
             "released_at": released["released_at"] if released else None,
             "subscribers": list(by_sub.values())}
+
+
+# ---------------------------------------------------------------------------
+# downstream posting ledger (下游入账台账)
+# ---------------------------------------------------------------------------
+
+class PostingIn(BaseModel):
+    subscriber_id: Optional[int] = None
+    subscriber_name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    window_start: int = Field(ge=0)
+    key: str = Field(min_length=1, max_length=200)
+    version: int = Field(
+        ge=1,
+        description="the result version the downstream says it has posted (入账)")
+
+
+@app.post("/postings", status_code=200)
+def posting_report(body: PostingIn):
+    """A downstream reports which version of one result it has posted.
+
+    The report only counts when it names a version that was actually sent to
+    this downstream (a deliveries row exists): reporting a version we never
+    sent is rejected with 409 — it changes nothing, though the rejection
+    itself is traced in the ledger history. A report below the current posted
+    position is a rollback: the ledger regresses with it (already-delivered
+    records are never erased), and the pair turns LAGGING until its posting
+    catches up again. Re-registering the downstream under a new URL does not
+    move the ledger — it is keyed by the subscriber, not the address.
+    """
+    if (body.subscriber_id is None) == (body.subscriber_name is None):
+        raise HTTPException(422, "provide exactly one of subscriber_id or subscriber_name")
+    conn = connect()
+    try:
+        with conn, conn.cursor() as cur:
+            if body.subscriber_id is not None:
+                cur.execute("SELECT id FROM subscribers WHERE id = %s",
+                            (body.subscriber_id,))
+            else:
+                cur.execute("SELECT id FROM subscribers WHERE name = %s",
+                            (body.subscriber_name,))
+            row = cur.fetchone()
+            if row is None:
+                raise HTTPException(404, "no such subscriber")
+            subscriber_id = row[0]
+        posting = report_posting(conn, subscriber_id, body.window_start,
+                                 body.key, body.version)
+    finally:
+        conn.close()
+    if posting is None:
+        raise HTTPException(
+            409,
+            f"version {body.version} of ({body.window_start}, {body.key!r}) was "
+            "never sent to this subscriber; the report does not count")
+    return {"posting": posting}
+
+
+@app.get("/postings")
+def postings(subscriber: Optional[str] = None, key: Optional[str] = None,
+             window_start: Optional[int] = None, status: Optional[str] = None,
+             limit: int = Query(default=200)):
+    """The posting ledger, one row per (downstream, result) ever sent to:
+    which version the downstream reported posted, which version we confirmed
+    delivered, and whether the pair is ALIGNED, LAGGING (its later versions
+    are currently held for this downstream) or AHEAD_UNCONFIRMED (it posted a
+    version we are still retrying). Pairs with no report yet have a null
+    status/reported_version — the gate only engages once a downstream starts
+    reporting."""
+    if status is not None and status not in POSTING_STATUSES:
+        raise HTTPException(422, f"status must be one of {POSTING_STATUSES}")
+    sql = """
+    WITH sent AS (
+        SELECT d.subscriber_id, d.window_start, d.key,
+               MAX(d.window_end) AS window_end,
+               MAX(d.version) AS sent_up_to,
+               MAX(d.version) FILTER (WHERE d.status = 'DELIVERED') AS delivered_up_to,
+               MIN(d.version) FILTER (WHERE d.status <> 'DELIVERED') AS inflight_version
+        FROM deliveries d
+        GROUP BY d.subscriber_id, d.window_start, d.key
+    )
+    SELECT s.id AS subscriber_id, s.name AS subscriber, s.url, s.active,
+           sent.window_start, sent.window_end, sent.key,
+           pl.reported_version,
+           COALESCE(pl.delivered_up_to, sent.delivered_up_to) AS delivered_up_to,
+           sent.sent_up_to, sent.inflight_version,
+           pl.status,
+           (pl.status = 'LAGGING') AS gated,
+           pl.first_reported_at, pl.updated_at AS ledger_updated_at
+    FROM sent
+    JOIN subscribers s ON s.id = sent.subscriber_id
+    LEFT JOIN posting_ledger pl
+      ON pl.subscriber_id = sent.subscriber_id
+     AND pl.window_start = sent.window_start
+     AND pl.key = sent.key"""
+    conds, args = [], []
+    if subscriber is not None:
+        conds.append("s.name = %s")
+        args.append(subscriber)
+    if key is not None:
+        conds.append("sent.key = %s")
+        args.append(key)
+    if window_start is not None:
+        conds.append("sent.window_start = %s")
+        args.append(window_start)
+    if status is not None:
+        conds.append("pl.status = %s")
+        args.append(status)
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY s.name, sent.key, sent.window_start LIMIT %s"
+    args.append(min(max(limit, 1), 1000))
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, args)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    for r in rows:
+        r["gated"] = bool(r["gated"])
+    return {"postings": rows}
+
+
+@app.get("/postings/history")
+def posting_history(subscriber: Optional[str] = None,
+                    subscriber_id: Optional[int] = None,
+                    window_start: Optional[int] = None, key: Optional[str] = None,
+                    limit: int = Query(default=200)):
+    """The append-only ledger trail: every report (accepted or rejected) and
+    every delivery advance, each with the ledger state before and after. This
+    is where "when did it flip from ALIGNED to LAGGING, and which version
+    knocked it lagging" is answered — look for DELIVERY_ADVANCED rows with
+    prev_status='ALIGNED' and status='LAGGING'; cause_version is the culprit.
+    Fully filtered (one downstream, one result) the trail comes back
+    chronological; otherwise it is the global feed, newest first."""
+    sql = """SELECT e.id, s.name AS subscriber, e.subscriber_id, e.window_start,
+                    e.key, e.event, e.cause_version,
+                    e.prev_reported, e.prev_delivered, e.prev_status,
+                    e.reported_version, e.delivered_up_to, e.status,
+                    e.detail, e.created_at
+             FROM posting_events e JOIN subscribers s ON s.id = e.subscriber_id"""
+    conds, args = [], []
+    if subscriber is not None:
+        conds.append("s.name = %s")
+        args.append(subscriber)
+    if subscriber_id is not None:
+        conds.append("e.subscriber_id = %s")
+        args.append(subscriber_id)
+    if window_start is not None:
+        conds.append("e.window_start = %s")
+        args.append(window_start)
+    if key is not None:
+        conds.append("e.key = %s")
+        args.append(key)
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    pair_scoped = ((subscriber is not None or subscriber_id is not None)
+                   and window_start is not None and key is not None)
+    sql += " ORDER BY e.id" + ("" if pair_scoped else " DESC") + " LIMIT %s"
+    args.append(min(max(limit, 1), 1000))
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, args)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {"events": rows}
