@@ -8,9 +8,17 @@ Covers:
   before the first release are not;
 - versions are copied with their original payload kind/version/timestamp and
   delivered in per-result version order;
-- backfill cannot cut in front of an unfinished realtime delivery;
 - a realtime correction created while replay is paused still uses the
-  REALTIME channel and bypasses the backfill queue;
+  REALTIME channel and is not rerouted into the backfill queue;
+- per-result version order spans both channels: a realtime correction whose
+  result's earliest version is still queued in the backfill waits BEHIND it
+  (old version delivered first, no channel overtaking) — different results
+  stay independent, and the cross-channel waits can never deadlock;
+- a realtime correction whose result's earlier version is still queued in the
+  backfill waits BEHIND that history (old version delivered first, no channel
+  overtaking, no deadlock);
+- a range whose bounds land mid-window still replays the whole containing
+  window (bounds are snapped to window boundaries);
 - replay can stop and resume at its current position;
 - replaying the same downstream/range never enqueues a version twice.
 """
@@ -137,6 +145,7 @@ def main():
     tag = f"bf-{now}"
     hist = f"{tag}-hist"
     held = f"{tag}-held"
+    mid = f"{tag}-mid"
     live = f"{tag}-live"
     live_ws = ws + 2 * W
 
@@ -150,9 +159,13 @@ def main():
     upsert(B, f"{hist}-b1", ws + 1500, hist, {"n": 1})
     upsert(A, f"{held}-a1", ws + 1000, held)
     upsert(B, f"{held}-b1", ws + 1500, held)
+    upsert(A, f"{mid}-a1", ws + 1000, mid, {"n": 1})
+    upsert(B, f"{mid}-b1", ws + 1500, mid, {"n": 1})
     set_wm(ws + W + 1)
     wait_for("history v1 computed", lambda: head(ws, hist) and head(ws, hist)["version"] == 1)
     wait_for("held v1 computed", lambda: head(ws, held) and head(ws, held)["version"] == 1)
+    wait_for("mid v1 computed", lambda: head(ws, mid) and head(ws, mid)["version"] == 1)
+    post(R, "/releases", {"key": mid})  # externally released at v1
 
     # v1/v2 remain internal. v3 is the first externally released version.
     upsert(B, f"{hist}-b2", ws + 2500, hist, {"n": 2})
@@ -180,7 +193,11 @@ def main():
     wait_for("held key has an internal v2", lambda: head(ws, held)["version"] == 2)
     check("held key is not externally released", head(ws, held)["released"] is False)
 
-    # Advance far enough for a separate realtime window used as the live barrier.
+    # A released correction of the mid-window-bounds fixture key.
+    upsert(B, f"{mid}-b2", ws + 2500, mid, {"n": 7})
+    wait_for("mid key has released v2", lambda: head(ws, mid)["version"] == 2)
+
+    # Advance far enough for a separate realtime window used as live traffic.
     set_wm(live_ws + W + 1)
     sub_name = f"backfill-{now}"
     sub = post(R, "/subscriptions",
@@ -190,7 +207,7 @@ def main():
     post(R, "/release-gates", {"key": live, "open": True})
     upsert(A, f"{live}-a1", live_ws + 1000, live)
     upsert(B, f"{live}-b1", live_ws + 1500, live)
-    wait_for("realtime barrier is retrying", lambda: next(
+    wait_for("realtime live v1 is retrying", lambda: next(
         (x for x in get(R, "/deliveries", subscriber=sub_name,
                         key=live, status="RETRYING")["deliveries"]
          if x["channel"] == "REALTIME"), None), timeout=20)
@@ -215,14 +232,14 @@ def main():
     check("cannot start an overlapping job while one is active",
           overlap.get("_status") == 409, str(overlap))
 
-    # Let the realtime barrier through, but make the first historical attempt
-    # fail so the job has a resumable retry position.
+    # Let the live delivery through (fail only backfills now), but make the
+    # first historical attempt fail so the job has a resumable retry position.
     with LOCK:
         MODE["mode"] = "fail_backfill"
-    wait_for("realtime barrier delivered before backfill",
+    wait_for("realtime live v1 delivered",
              lambda: received(live, "REALTIME")
              and received(live, "REALTIME")[0]["version"] == 1)
-    wait_for("first backfill attempt is retrying behind the barrier",
+    wait_for("first backfill attempt is retrying",
              lambda: job(job_id)["retrying_versions"] == 1, timeout=20)
     check("no backfill delivered while its first version is retrying",
           received(channel="BACKFILL") == [])
@@ -263,13 +280,105 @@ def main():
           all(d["backfill_job_id"] == job_id and d["channel"] == "BACKFILL"
               for d in history))
     check("internal-only held key was never backfilled", received(held) == [])
+
+    # --- mid-window bounds: a time landing inside the window must still
+    # replay the whole window, for a different subscriber. Bounds here are
+    # deliberately NOT window starts.
+    mid_sub_name = f"backfill-mid-{now}"
+    mid_sub = post(R, "/subscriptions",
+                   {"name": mid_sub_name, "url": f"{RECV_BASE}/recv"})
+    mid_sub_id = mid_sub["subscription"]["id"]
+    mid_job = post(R, "/backfills", {
+        "subscriber_id": mid_sub_id,
+        "from_window_start": ws + 1000,   # inside the window starting at ws
+        "to_window_start": ws + W - 1,    # still inside the same window
+    })
+    check("mid-window bounds snap onto the containing window",
+          mid_job.get("backfill", {}).get("window_start_from") == ws
+          and mid_job.get("backfill", {}).get("window_start_to") == ws + W,
+          str(mid_job))
+    check("mid-window range enqueues both released versions of the window",
+          mid_job.get("backfill", {}).get("total_versions") == 2, str(mid_job))
+    mid_job_id = mid_job["backfill"]["id"]
+    wait_for("mid-window backfill completes",
+             lambda: job(mid_job_id)["status"] == "COMPLETED", timeout=30)
+    mid_got = received(mid, "BACKFILL")
+    check("a time inside the window replays the whole window, in version order",
+          [(d["version"], d["kind"]) for d in mid_got]
+          == [(1, "NEW"), (2, "CORRECTION")],
+          str([(d["version"], d["kind"]) for d in mid_got]))
+
+    # --- cross-channel version order: while a third subscriber's replay is
+    # held at its first version, a realtime correction of that SAME result must
+    # wait behind the history instead of overtaking it (旧版先到, 订正后到).
+    ord_sub_name = f"backfill-ord-{now}"
+    ord_sub = post(R, "/subscriptions",
+                   {"name": ord_sub_name, "url": f"{RECV_BASE}/recv"})
+    ord_sub_id = ord_sub["subscription"]["id"]
+    ord_job = post(R, "/backfills", {
+        "subscriber_id": ord_sub_id,
+        "from_window_start": ws,
+        "to_window_start": ws + W,
+    })
+    ord_job_id = ord_job["backfill"]["id"]
+    # The range copies v3..v6; hold the whole chain at v3 by failing backfills.
+    with LOCK:
+        MODE["mode"] = "fail_backfill"
+    wait_for("ordering backfill v3 is retrying",
+             lambda: job(ord_job_id)["retrying_versions"] >= 1, timeout=20)
+
+    # A fresh correction of the same (ws, hist) result goes REALTIME. It must
+    # NOT even be attempted while v3 of the history is still undelivered: the
+    # cross-channel barrier keeps its outbox row PENDING.
+    upsert(B, f"{hist}-b3", ws + 2600, hist, {"n": 11})
+    wait_for("ordering realtime v7 correction exists",
+             lambda: head(ws, hist) and head(ws, hist)["version"] == 7)
+    wait_for("ordering realtime correction is queued behind history", lambda: next(
+        (x for x in get(R, "/deliveries", subscriber=ord_sub_name,
+                        key=hist)["deliveries"]
+         if x["channel"] == "REALTIME" and x["version"] == 7), None), timeout=20)
+    time.sleep(2.5)
+    blocked_rows = get(R, "/deliveries", subscriber=ord_sub_name,
+                       key=hist, limit=50)["deliveries"]
+    v7_row = next((x for x in blocked_rows
+                   if x["channel"] == "REALTIME" and x["version"] == 7), None)
+    check("realtime correction is held PENDING and never overtakes the history",
+          v7_row is not None and v7_row["status"] == "PENDING"
+          and all(x["status"] != "DELIVERED" for x in blocked_rows),
+          str([(x["version"], x["channel"], x["status"]) for x in blocked_rows]))
+
+    with LOCK:
+        MODE["mode"] = "ok"
+    wait_for("ordering backfill completes",
+             lambda: job(ord_job_id)["status"] == "COMPLETED", timeout=30)
+    # realtime v7 only went to the ordering subscriber — read its ladder.
+    ord_rows = get(R, "/deliveries", subscriber=ord_sub_name,
+                   key=hist, status="DELIVERED", limit=50)["deliveries"]
+    check("ordering subscriber got v3..v7 strictly in version order",
+          [d["version"] for d in ord_rows] == [3, 4, 5, 6, 7]
+          and [d["channel"] for d in ord_rows]
+          == ["BACKFILL", "BACKFILL", "BACKFILL", "BACKFILL", "REALTIME"],
+          str([(d["version"], d["channel"]) for d in ord_rows]))
+    check("correction arrived AFTER the earliest version, not before it",
+          next(i for i, d in enumerate(ord_rows) if d["version"] == 7)
+          > next(i for i, d in enumerate(ord_rows) if d["version"] == 3),
+          "")
+
+    # The ordering guarantee is per (key): one result's history never overtakes
+    # that same result's versions across channels; different results stay
+    # independent and never block each other.
     arrival = [(d["key"], d["version"], d["channel"]) for d in DELIVERIES]
-    first_backfill_index = next(i for i, x in enumerate(arrival)
-                                if x[2] == "BACKFILL")
-    check("history did not cut in front of the subscriber's realtime orders",
-          all(x[2] == "REALTIME" for x in arrival[:first_backfill_index])
-          and (live, 2, "REALTIME") in arrival[:first_backfill_index],
-          str(arrival))
+    by_key = {}
+    for k, v, ch in arrival:
+        by_key.setdefault(k, []).append((v, ch))
+    for k, seq in by_key.items():
+        versions = [v for v, ch in seq]
+        check(f"{k}: delivered in strictly ascending version order",
+              versions == sorted(versions) and len(versions) == len(set(versions)),
+              str(seq))
+    check("realtime live correction still flowed while backfill was paused",
+          by_key.get(live) == [(1, "REALTIME"), (2, "REALTIME")],
+          str(by_key.get(live)))
 
     # Same subscriber + same range again: existing delivery identity wins, so
     # this creates a completed zero-version job and causes no duplicate POST.

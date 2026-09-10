@@ -97,6 +97,31 @@ def released_version_kind(version, first_released_version, reason, status):
     return delivery_kind(reason, status)
 
 
+def normalize_backfill_range(from_ms, to_ms, window_size_ms):
+    """Snap an event-time replay range onto tumbling-window boundaries.
+
+    The caller speaks event time ("replay everything covering [from, to)"),
+    while candidate selection compares against ``window_start``. Without this,
+    a bound landing *inside* a window — ``from`` at ws+δ, say — silently drops
+    the whole window that actually contains that instant: its window_start is
+    below the bound even though the requested time falls in it. A bound already
+    on a window boundary is left untouched, so callers that pass exact window
+    starts keep getting the same half-open ``[window_start, window_start)``
+    selection.
+
+    Returns ``(from_window_start, to_window_start)``:
+    - the lower bound floors to the start of the window containing ``from``;
+    - the upper bound ceils to the end of the window containing ``to - 1`` — the
+      window is included whenever the range reaches into it.
+    """
+    from_ws = (from_ms // window_size_ms) * window_size_ms
+    # Boundary right after the window containing the last included event time
+    # (to - 1): that window's window_start is below the bound, so it would be
+    # missed by a plain `< to` comparison unless we move the bound up.
+    to_ws = ((to_ms - 1) // window_size_ms + 1) * window_size_ms
+    return from_ws, to_ws
+
+
 def retry_delay_ms(attempts, base_ms, max_ms):
     """Exponential backoff after ``attempts`` failed attempts (attempts >= 1)."""
     return min(base_ms * (2 ** (attempts - 1)), max_ms)

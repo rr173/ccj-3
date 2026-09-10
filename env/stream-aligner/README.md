@@ -82,6 +82,35 @@
 新登记的下游从登记之后产生的版本开始投递；历史状态先通过 `GET /results/*` 拉取
 （这正是已有下游一直在用的查询路径）。
 
+## 历史补推（backfill）
+
+新下游也可以不自己捞查询接口，而是让 aligner 把**已对外放行过**的历史版本按顺序补投一遍：
+`POST /backfills` 建一个按下游的补推任务，把区间内每个结果自首放版本起的全部已放行版本
+复制成 `channel=BACKFILL` 的投递（内部扣着的版本永不补推），payload / kind / 版本时间戳
+保持原样；可 `stop`（暂停）/ `resume`（继续），任务状态与行数随时可查。
+
+| 语义 | 保证 |
+|---|---|
+| 区间按事件时间、自动对齐窗口 | 入参是**事件时间**的半开区间 `[from, to)`，服务端先吸附到窗口边界：下界**向下**取整到它所在窗的窗起点，上界**向上**取整到它所触及的最后一窗的窗尾。所以时间**落在窗里但不是窗开头**，整窗也照样补得出来；本来就传窗起点的调用得到完全相同的范围。任务行里存的是吸附后的 `[window_start_from, window_start_to)` |
+| 旧版必须先到 | 同一 `(window_start, key)` 的版本序**跨通道**生效：补推队列里还压着该结果更早的版本时，期间新产生的实时订正（`REALTIME`）一律排队等待——最早那版先送达，订正随后到，不会出现"订正先到、首版后到"把下游版本号搅乱。屏障只看同一个结果，不同结果互不等待，等待边只指向更小版本号，因此两条通道不可能死锁 |
+| 实时不被历史饿死 | 每轮派发先清空到期的实时行、再派发补推行；大量历史补推不会挡住本来就该到的实时消息。不同结果之间不互相阻塞（投递语义本来就按结果独立） |
+| 不重 | 投递身份 `(subscriber, window_start, key, version)` 全局唯一：已实时收过、或上一个补推任务已复制过的版本不会再入队；重复建任务是零版本的已完成任务，不发重复 HTTP |
+| 可暂停 | `stop` 后行与重试计时原样留在原地，`resume` 从断点继续；行只更新不删除，崩溃后接着投 |
+
+补推屏障不会死锁：任何行都只等**同一结果、版本号更小**的行，等待关系无环；不同结果
+之间从无等待边。派发器每轮先处理实时通道再处理补推通道，所以大量历史补推也不会让
+本来就该到的实时消息排不上。
+
+| 方法/路径 | 说明 |
+|---|---|
+| `POST /backfills` | `{"subscriber_id" 或 "subscriber_name", "from_window_start", "to_window_start"}`：事件时间半开区间，自动吸附窗口边界；每个下游同时只允许一个 RUNNING/PAUSED 任务 |
+| `GET /backfills?subscriber=&status=` | 任务列表，含已投/在投/重试中版本计数 |
+| `GET /backfills/{id}` | 单个任务状态与计数 |
+| `POST /backfills/{id}/stop` / `/resume` | 暂停 / 继续；对已完成任务操作是幂等 no-op |
+
+投递信封与实时通道一致，只多带 `channel="BACKFILL"` 与 `backfill_job_id`；下游按同一套
+`(window_start, key, version)` 契约入账即可，无需区分通道。
+
 ## 对外放行（release gate）
 
 内部对齐结果（版本、审计、业务单）照算照查，但**默认不算对外给出**：没放行之前不会生成
@@ -248,7 +277,11 @@ python3 tests/test_core.py       # 或 make unit —— 纯逻辑单测，无需
 | `GET /releases/history?key=` | 一键的放行操作审计（RELEASE / GATE_OPEN / GATE_CLOSE）与逐窗放行账本 |
 | `GET /subscriptions` | 全部下游及各状态投递数（delivered / retrying / pending） |
 | `DELETE /subscriptions/{id}` | 停用下游（停投不删记录；重新登记即恢复并补齐积压） |
-| `GET /deliveries?window_start=&key=&subscriber=&status=` | 投递流水（outbox 明细）：版本、kind、状态、重试次数、最近错误 |
+| `POST /backfills` | 为一个已登记下游补推已放行历史：`{"subscriber_id" 或 "subscriber_name", "from_window_start", "to_window_start"}`，事件时间半开区间，自动吸附窗口边界（落在窗里的时间补整窗）；同一下游同时只允许一个活跃任务 |
+| `GET /backfills?subscriber_id=&subscriber=&status=` | 补推任务及已投/待投/重试计数 |
+| `GET /backfills/{id}` | 单个补推任务状态 |
+| `POST /backfills/{id}/stop` / `/resume` | 暂停 / 继续补推（对已完成任务幂等） |
+| `GET /deliveries?window_start=&key=&subscriber=&status=&channel=` | 投递流水（outbox 明细）：版本、kind、状态、重试次数、最近错误；`channel=REALTIME/BACKFILL` |
 | `GET /healthz` | 健康检查 |
 
 ## 配置

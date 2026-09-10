@@ -35,10 +35,16 @@ an earlier one), retries failures with exponential backoff, and never gives up
 Historical replays are separate BACKFILL-channel deliveries: a per-subscriber
 job copies only versions that already crossed the release gate, preserving
 each version's original kind, payload, timestamp and order. The live REALTIME
-channel always has priority, so history cannot cut in front of a downstream's
-in-flight live order; a replay job can be paused and later resumed, and the
-outbox identity prevents the same subscriber/version from being replayed
-twice.
+channel is dispatched first on every poll, so live traffic is never starved
+behind a large replay; the decisive guarantee is per-result: versions of one
+(window, key) always reach the downstream in version order across both
+channels — a realtime correction born while that result's earlier version is
+still queued in the replay waits behind the history. Different results never
+block one another and the wait graph only points at strictly smaller versions,
+so the two channels cannot deadlock. A replay job can be paused and later
+resumed, and the outbox identity prevents the same subscriber/version from
+being replayed twice. Replay ranges speak event time and are snapped to window
+boundaries, so a bound landing mid-window never drops the window containing it.
 """
 import json
 import logging
@@ -56,7 +62,8 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.core import (ORDER_STATUSES, build_order_snapshot, compute_payload,
-                      decide, delivery_kind, evaluate_order, order_reason,
+                      decide, delivery_kind, evaluate_order,
+                      normalize_backfill_range, order_reason,
                       released_version_kind, retry_delay_ms, should_deliver,
                       side_evidence, window_of, window_ready)
 
@@ -1020,12 +1027,21 @@ def set_gate(conn, key, open_):
 # Copies are ordinary deliveries with channel='BACKFILL'. The delivery primary
 # identity (subscriber, window, key, version) stays unique, so the same
 # downstream can never replay a version it already has, whether the existing
-# row is realtime or a previous backfill. The live dispatcher has priority:
-# backfill rows are due only when the subscriber has no unfinished REALTIME
-# delivery. Consequently a historical replay cannot cut in front of a live
-# order, while corrections created during replay remain REALTIME and bypass
-# the backfill queue. A replay job can be paused; its delivery rows and retry
-# timers stay exactly where they were, so resume continues at the same place.
+# row is realtime or a previous backfill. REALTIME rows are dispatched first on
+# every poll, so live traffic that is already due is never starved behind a
+# large replay; corrections created during replay keep their REALTIME channel
+# and are not rerouted into the backfill queue. A replay job can be paused; its
+# delivery rows and retry timers stay exactly where they were, so resume
+# continues at the same place.
+#
+# Version ordering across channels is per (window, key): a version is only due
+# once every EARLIER version of the same result is DELIVERED, no matter which
+# channel it rides. During a replay a fresh correction (REALTIME v2) therefore
+# waits behind the historical v1 still in the BACKFILL queue instead of
+# overtaking it — the earliest version always reaches the downstream first.
+# The barrier is deliberately scoped to one result and the dispatch loops are
+# acyclic (a row only waits on strictly smaller versions), so the two channels
+# can never deadlock; different results simply never wait on each other.
 
 BACKFILL_CANDIDATE_SQL = """
 WITH first_release AS (
@@ -1047,6 +1063,13 @@ ORDER BY r.id
 def create_backfill(conn, subscriber_id, window_start_from, window_start_to):
     """Create and materialize one subscriber's historical replay job.
 
+    The requested range speaks event time and is snapped to tumbling-window
+    boundaries first (normalize_backfill_range): the window containing the
+    lower bound is included, and the window the range reaches into at the top
+    is included too — a bound landing mid-window must never drop the whole
+    window. Bounds already aligned to window starts are unchanged, so the
+    stored half-open range is exactly [from_window_start, to_window_start).
+
     Candidate selection and delivery copies are one repeatable-read
     transaction, making the replay a snapshot of externally released versions
     at creation time. A later release/correction stays realtime and is not
@@ -1054,6 +1077,8 @@ def create_backfill(conn, subscriber_id, window_start_from, window_start_to):
     that is the database-level guarantee that one downstream never gets the
     same version through two backfills.
     """
+    from_ws, to_ws = normalize_backfill_range(
+        window_start_from, window_start_to, WINDOW_MS)
     with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         cur.execute(
@@ -1083,12 +1108,12 @@ def create_backfill(conn, subscriber_id, window_start_from, window_start_to):
                    (subscriber_id, window_start_from, window_start_to, status)
                VALUES (%s, %s, %s, 'RUNNING')
                RETURNING *""",
-            (subscriber_id, window_start_from, window_start_to),
+            (subscriber_id, from_ws, to_ws),
         )
         job = cur.fetchone()
         cur.execute(
             BACKFILL_CANDIDATE_SQL,
-            (window_start_from, window_start_to),
+            (from_ws, to_ws),
         )
         candidates = cur.fetchall()
         enqueued = 0
@@ -1184,11 +1209,19 @@ def complete_finished_backfill_jobs(cur):
 # delivery dispatcher (transactional outbox)
 # ---------------------------------------------------------------------------
 
-# A REALTIME delivery is due only when every earlier REALTIME version of the
-# same result for the same subscriber is DELIVERED — version N+1 must never
-# reach a downstream before version N. Different results proceed independently.
-# BACKFILL deliveries are selected by a separate query and have an additional
-# subscriber-level barrier so history can never jump ahead of a live backlog.
+# A delivery is due only when every earlier version of the same result for the
+# same subscriber is DELIVERED — version N+1 must never reach a downstream
+# before version N. The ordering barrier spans BOTH channels: a realtime
+# correction born while a historical replay is queued waits behind the
+# backfilled earlier versions of that same result, so the earliest version
+# always arrives first. The barrier is scoped to one (window, key) on purpose:
+# different results proceed independently and must never block one another —
+# adding a subscriber-wide live barrier on top of cross-channel ordering would
+# close a cycle (a backfilled later version waiting behind live traffic that
+# is itself waiting on an earlier backfill), deadlocking every chain involved.
+# REALTIME is still dispatched first on every poll, so history never jumps
+# ahead of live traffic that is already due; it simply does not wait on live
+# rows of a *different* result.
 DUE_SQL = """
 SELECT d.id, d.subscriber_id, s.name AS subscriber, s.url,
        d.window_start, d.window_end, d.key, d.version, d.kind, d.payload,
@@ -1200,9 +1233,10 @@ WHERE s.active
   AND d.status IN ('PENDING', 'RETRYING')
   AND d.next_attempt_at <= now()
   AND NOT EXISTS (
+      -- cross-channel version order: an earlier version of this result,
+      -- whether REALTIME or BACKFILL, must be delivered first
       SELECT 1 FROM deliveries p
       WHERE p.subscriber_id = d.subscriber_id
-        AND p.channel = 'REALTIME'
         AND p.window_start = d.window_start
         AND p.key = d.key
         AND p.version < d.version
@@ -1224,26 +1258,18 @@ WHERE s.active
   AND d.channel = 'BACKFILL'
   AND d.status IN ('PENDING', 'RETRYING')
   AND d.next_attempt_at <= now()
-  -- Per-result version order, limited to the backfill channel. A newer live
-  -- version may overtake history (see the next barrier), but two historical
-  -- versions of the same result still never arrive out of order.
+  -- Per-result version order across both channels: an earlier version of this
+  -- same result still pending (including a realtime one) must go first. The
+  -- barrier stays scoped to one (window, key): a different result's live
+  -- traffic neither overtakes nor blocks this one, and cycles across results
+  -- are impossible.
   AND NOT EXISTS (
       SELECT 1 FROM deliveries p
       WHERE p.subscriber_id = d.subscriber_id
-        AND p.channel = 'BACKFILL'
         AND p.window_start = d.window_start
         AND p.key = d.key
         AND p.version < d.version
         AND p.status <> 'DELIVERED'
-  )
-  -- History cannot cut in front of any live delivery this subscriber is still
-  -- processing. A permanently failing live order intentionally keeps replay
-  -- paused; corrections stay on the REALTIME channel and are not rerouted here.
-  AND NOT EXISTS (
-      SELECT 1 FROM deliveries live
-      WHERE live.subscriber_id = d.subscriber_id
-        AND live.channel = 'REALTIME'
-        AND live.status IN ('PENDING', 'RETRYING')
   )
 ORDER BY d.id
 LIMIT %s
@@ -1306,10 +1332,11 @@ def deliver_one(conn, row):
 def dispatch_due(conn):
     """Deliver everything currently due, draining version chains in one pass.
 
-    REALTIME is dispatched first on every iteration. Backfill is considered
-    only when no live delivery is currently due, so a large history can never
-    starve or reorder a subscriber's live traffic. Within each channel, a
-    success may unlock the next version of the same result.
+    REALTIME is dispatched first on every iteration (backfill is only reached
+    when no live row is due), so a large replay never starves live traffic.
+    Version order is enforced per (window, key) across both channels — a
+    success may unlock the next version of the same result even if that next
+    version rides the other channel; different results never block each other.
     """
     for _ in range(20):
         progressed = False
@@ -1686,8 +1713,14 @@ class GateIn(BaseModel):
 class BackfillIn(BaseModel):
     subscriber_id: Optional[int] = None
     subscriber_name: Optional[str] = Field(default=None, min_length=1, max_length=200)
-    from_window_start: int = Field(ge=0, description="inclusive lower bound by window_start")
-    to_window_start: int = Field(ge=0, description="exclusive upper bound by window_start")
+    from_window_start: int = Field(
+        ge=0,
+        description="event-time lower bound (inclusive); snapped DOWN to the "
+                    "start of the window containing it")
+    to_window_start: int = Field(
+        ge=0,
+        description="event-time upper bound (exclusive); snapped UP to the end "
+                    "of the last window it reaches into")
 
 
 @app.post("/releases")
@@ -1917,12 +1950,19 @@ def backfill_job_json(cur, job):
 def create_backfill_endpoint(body: BackfillIn):
     """Replay externally released history for one registered downstream.
 
-    The window range is half-open and compared against ``window_start``:
+    Both bounds speak event time and are snapped to tumbling-window
+    boundaries: the lower bound is floored to its window's start and the
+    exclusive upper bound is ceiled to the end of the last window it reaches
+    into, so asking for a time *inside* a window replays the whole window.
+    The stored job range is the resulting half-open
     ``[from_window_start, to_window_start)``. Only versions at or after each
     window's first externally released version are copied; internal versions
     held before release are not. The copied versions keep their original
     payload, kind and version timestamp, and are dispatched in the BACKFILL
-    channel behind any unfinished live delivery for this subscriber.
+    channel behind any unfinished live delivery for this subscriber. A later
+    realtime correction of a result whose earlier version is still in this
+    queue waits behind that history — versions of one result always reach the
+    downstream in version order.
     """
     if body.to_window_start <= body.from_window_start:
         raise HTTPException(422, "to_window_start must be greater than from_window_start")

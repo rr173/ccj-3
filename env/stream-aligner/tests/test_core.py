@@ -6,9 +6,9 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "services", "aligner"))
 
 from app.core import (compute_payload, decide, delivery_kind, effective,  # noqa: E402
-                      payload_hash, released_version_kind, releasable,
-                      retry_delay_ms, should_deliver, side_evidence, window_of,
-                      window_ready)
+                      normalize_backfill_range, payload_hash,
+                      released_version_kind, releasable, retry_delay_ms,
+                      should_deliver, side_evidence, window_of, window_ready)
 
 W = 30_000
 
@@ -293,6 +293,47 @@ class TestRetryDelay(unittest.TestCase):
     def test_capped_at_max(self):
         self.assertEqual(retry_delay_ms(100, 1000, 60000), 60000)
         self.assertEqual(retry_delay_ms(1, 5000, 3000), 3000)
+
+
+class TestNormalizeBackfillRange(unittest.TestCase):
+    """Bounds speak event time; the window containing a bound must be picked.
+
+    A time landing inside a window — not at its start — must still replay the
+    whole window (补一段历史: 时间落在那一窗里, 那一窗就要能补上).
+    """
+
+    def test_exact_window_starts_are_unchanged(self):
+        # callers already passing aligned boundaries keep the same range
+        self.assertEqual(normalize_backfill_range(0, W, W), (0, W))
+        self.assertEqual(normalize_backfill_range(W, 3 * W, W), (W, 3 * W))
+
+    def test_lower_bound_inside_window_floors_to_window_start(self):
+        # from = ws + δ: the window containing it is included
+        self.assertEqual(normalize_backfill_range(1000, W, W), (0, W))
+        self.assertEqual(normalize_backfill_range(W + 1, 2 * W, W), (W, 2 * W))
+
+    def test_upper_bound_inside_window_includes_that_window(self):
+        # exclusive to = ws + δ still reaches into the window starting at ws
+        self.assertEqual(normalize_backfill_range(0, 1, W), (0, W))
+        self.assertEqual(normalize_backfill_range(0, W + 1, W), (0, 2 * W))
+
+    def test_range_inside_one_single_window_covers_whole_window(self):
+        # both bounds mid-window: the whole window is backfilled, never dropped
+        self.assertEqual(normalize_backfill_range(1000, 2000, W), (0, W))
+        self.assertEqual(normalize_backfill_range(W + 100, W + 200, W),
+                         (W, 2 * W))
+
+    def test_range_across_several_windows(self):
+        self.assertEqual(normalize_backfill_range(W + 100, 4 * W + 100, W),
+                         (W, 5 * W))
+
+    def test_window_start_of_normalized_range_aligns(self):
+        from_ws, to_ws = normalize_backfill_range(123_456, 234_567, W)
+        self.assertEqual(from_ws % W, 0)
+        self.assertEqual(to_ws % W, 0)
+        self.assertLessEqual(from_ws, 123_456)
+        self.assertGreaterEqual(to_ws, 234_567)
+        self.assertLess(from_ws, to_ws)
 
 
 if __name__ == "__main__":
