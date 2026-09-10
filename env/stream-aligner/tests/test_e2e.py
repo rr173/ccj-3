@@ -145,6 +145,9 @@ def main():
         ev(f"{key}-b2", ws + 2500, key, payload={"s": "y"}),
         ev(f"{key}-b-hb", push, "__hb__"),
     ]})
+    # Gate defaults to closed per key: open this key's release gate so its
+    # initial result (and every later correction) is given externally.
+    post(R, "/release-gates", {"key": key, "open": True})
     v1 = wait_for("initial result once both watermarks pass",
                   lambda: head(ws, key))
     if v1:
@@ -222,6 +225,12 @@ def main():
     post(B, "/events", {"events": [ev(f"{key2}-b1", ws + 1000, key2),
                                    ev(f"{key2}-b-hb", push, "__hb__")]})
     wait_for("second key initial result", lambda: head(ws, key2))
+    # Explicit one-shot release of key2 (gate stays closed): the current head
+    # goes out as NEW; the withdrawals afterwards must still be delivered even
+    # though the key's gate never opens.
+    rel = post(R, "/releases", {"key": key2})
+    check("explicit release publishes the held head", rel["count"] == 1
+          and rel["released"][0]["version"] == 1, str(rel))
     post(A, "/events", ev(f"{key2}-r1", int(time.time() * 1000), key2,
                           typ="retract", retracts=f"{key2}-a1"))
     post(B, "/events", ev(f"{key2}-r1", int(time.time() * 1000), key2,

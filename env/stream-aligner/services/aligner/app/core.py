@@ -88,6 +88,51 @@ def retry_delay_ms(attempts, base_ms, max_ms):
     return min(base_ms * (2 ** (attempts - 1)), max_ms)
 
 
+# ---------------------------------------------------------------------------
+# External release gate (对外放行闸门), per business key.
+#
+# Alignment keeps computing internal result versions exactly as before — they
+# stay audited and queryable — but a version is only *given externally* (i.e.
+# outbox deliveries are created) once its (window, key) is released. Releasing
+# is one-shot per window: the version that is head AT RELEASE TIME goes out as
+# NEW (intermediate versions held back internally are never sent). A released
+# window is past the gate forever: every later correction / withdrawal /
+# revival is delivered regardless of whether the key's gate has since been
+# closed — closing only ever holds back windows that have never been out, and
+# nothing that went out can be reclaimed.
+# ---------------------------------------------------------------------------
+
+def should_deliver(gate_open, ever_released, status):
+    """Whether a freshly committed result version creates outbox deliveries.
+
+    ``gate_open``      — the key's per-business release switch is open;
+    ``ever_released``  — this (window, key) has been externally released once;
+    ``status``         — the new version's status (CURRENT / RETRACTED).
+
+    - never released, gate closed  → HELD: computed and queryable internally,
+      but nothing reaches the outbox (no push downstream);
+    - never released, gate open    → first live version is released at once as
+      NEW;
+    - never released, head RETRACTED → still nothing: the outside world never
+      knew this window, there is nothing to withdraw — a later revival while
+      the gate is open goes out as the first NEW;
+    - released before              → every later version flows
+      (CORRECTION / WITHDRAWAL), gate open or closed. Closing the gate never
+      swallows a window that has already crossed it.
+    """
+    if ever_released:
+        return True
+    return bool(gate_open and status == "CURRENT")
+
+
+def releasable(head_status, ever_released):
+    """An explicit release can only publish a held window that currently has a
+    live (non-empty) head and has never been released before. A window held
+    while fully retracted releases nothing (nothing ever went out); releasing
+    it again is a no-op, not a re-send."""
+    return (not ever_released) and head_status == "CURRENT"
+
+
 def decide(head, new_payload):
     """Decide the next version given the current head row and a recomputed payload.
 

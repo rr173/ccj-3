@@ -14,12 +14,23 @@ overwritten, and a watermark regression can never un-emit them. All
 recomputation is idempotent: identical content never yields a new version, so
 replays and restarts cannot double-count.
 
-Every emitted version is also fanned out to registered downstreams via a
-transactional outbox: the delivery rows are inserted in the same transaction
-as the result version, so a version can never exist without its deliveries.
-A dispatcher pushes deliveries to each subscriber in per-result version order
-(a later version is never sent before an earlier one), retries failures with
-exponential backoff, and never gives up — nothing is silently dropped.
+Computed results are internal until *externally released* (对外放行): a
+per-business-key gate (closed by default) holds fresh windows back — versions,
+audit and order folds still happen and remain queryable, but no delivery rows
+are created. A one-shot release (POST /releases) or opening the key's gate
+(POST /release-gates) publishes the window's head version AT THAT MOMENT as
+NEW; intermediate held versions are never sent. Release is one-shot per
+(window, key) and recorded in an immutable ledger, so later corrections,
+withdrawals and revivals keep flowing regardless of the gate — closing it only
+holds back windows that have never been out, and nothing released is reclaimed.
+
+Every released version is fanned out to registered downstreams via a
+transactional outbox: the release ledger row and deliveries are inserted in
+the same transaction as the result version, so a released version can never
+exist without its deliveries. A dispatcher pushes deliveries to each
+subscriber in per-result version order (a later version is never sent before
+an earlier one), retries failures with exponential backoff, and never gives up
+— nothing is silently dropped.
 """
 import json
 import logging
@@ -38,7 +49,8 @@ from pydantic import BaseModel, Field
 
 from app.core import (ORDER_STATUSES, build_order_snapshot, compute_payload,
                       decide, delivery_kind, evaluate_order, order_reason,
-                      retry_delay_ms, side_evidence, window_of, window_ready)
+                      retry_delay_ms, should_deliver, side_evidence,
+                      window_of, window_ready)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -205,6 +217,61 @@ CREATE TABLE IF NOT EXISTS biz_order_state (
     last_result_id BIGINT NOT NULL DEFAULT 0
 );
 INSERT INTO biz_order_state (id) VALUES (1) ON CONFLICT DO NOTHING;
+-- ---------------------------------------------------------------------------
+-- External release gate (对外放行), per business key.
+--
+-- release_gates: the per-key switch (closed unless opened). It only gates the
+-- FIRST external publication of each window.
+-- release_actions: append-only audit of every release operation (explicit one-
+-- shot releases, gate opens flushing the backlog, gate closes).
+-- window_releases: the release ledger — one immutable row per (window, key)
+-- that has crossed the gate. Its mere existence is the "already given
+-- externally" fact: once inserted, corrections/withdrawals keep flowing no
+-- matter what the gate does afterwards. Rows are never deleted, so a close can
+-- never reclaim what went out.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS release_gates (
+    key        TEXT PRIMARY KEY,
+    open       BOOLEAN NOT NULL DEFAULT FALSE,
+    opened_at  TIMESTAMPTZ,
+    closed_at  TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS release_actions (
+    id         BIGSERIAL PRIMARY KEY,
+    key        TEXT NOT NULL,
+    action     TEXT NOT NULL CHECK (action IN ('RELEASE', 'GATE_OPEN', 'GATE_CLOSE')),
+    window_start BIGINT,
+    result_version INT,
+    windows    JSONB NOT NULL,   -- [{window_start, window_end, version}, ...]
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS release_actions_key_idx ON release_actions (key, id);
+CREATE TABLE IF NOT EXISTS window_releases (
+    window_start  BIGINT NOT NULL,
+    window_end    BIGINT NOT NULL,
+    key           TEXT NOT NULL,
+    result_version INT NOT NULL,         -- the head version as released
+    action        TEXT NOT NULL CHECK (action IN ('RELEASE', 'GATE_OPEN')),
+    released_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (window_start, key)      -- one-shot per window; insert-only
+);
+-- Migration: windows that already had deliveries before the gate existed are
+-- retroactively "released", so their later corrections keep flowing (old
+-- subscribers' behaviour is preserved). Earliest delivered version = the
+-- version that first crossed the gate. Gates stay closed by default — only
+-- NEW windows of a key are held until it is released.
+INSERT INTO release_gates (key, open, updated_at)
+SELECT DISTINCT key, FALSE, now() FROM results
+ON CONFLICT (key) DO NOTHING;
+INSERT INTO window_releases (window_start, window_end, key, result_version, action, released_at)
+SELECT d.window_start,
+       (SELECT window_end FROM results r0
+         WHERE r0.window_start = d.window_start AND r0.key = d.key LIMIT 1),
+       d.key, MIN(d.version), 'RELEASE', now()
+FROM deliveries d
+GROUP BY d.window_start, d.key
+ON CONFLICT (window_start, key) DO NOTHING;
 """
 
 
@@ -277,12 +344,35 @@ def build_payload(cur, window_start, key):
 def emit(conn, window_start, key, reason, detail):
     """Recompute (window, key) and persist a new version iff the content changed.
 
-    The version row, its audit entry and one outbox delivery per subscriber
-    are written in a single transaction: a version never exists without its
-    audit trail, and never without the deliveries that push it downstream.
+    The version row and its audit entry are always written: the internal
+    result exists (and is queryable) the moment it is computed. Outbox
+    deliveries, however, are gated by the per-key external release:
+
+    - the window has been released once (a window_releases row exists): every
+      later version is delivered, gate open or closed — closing never holds
+      back what already crossed;
+    - never released, gate open: this live version is the first publication —
+      the release ledger row is written in this same transaction and the
+      version goes out as NEW;
+    - never released, gate closed: the version is held internally — no
+      deliveries exist until an explicit release (or a later gate open) takes
+      the then-current head.
+
+    Everything above commits in one transaction, so a delivered version can
+    never be missing its release record, and a held version can never leak an
+    outbox row.
     """
     window_end = window_start + WINDOW_MS
     with conn, conn.cursor() as cur:
+        # Serialize against a concurrent explicit release / gate flip for the
+        # same key: both paths take the gate row lock first.
+        cur.execute(
+            """INSERT INTO release_gates (key) VALUES (%s) ON CONFLICT (key) DO NOTHING""",
+            (key,),
+        )
+        cur.execute("SELECT open FROM release_gates WHERE key = %s FOR UPDATE", (key,))
+        gate_open = cur.fetchone()[0]
+
         payload = build_payload(cur, window_start, key)
         head = get_head(cur, window_start, key)
         nxt = decide(head, payload)
@@ -305,10 +395,39 @@ def emit(conn, window_start, key, reason, detail):
              head["version"] if head else None, nxt["version"], reason,
              psycopg2.extras.Json(detail) if detail is not None else None),
         )
+        cur.execute(
+            "SELECT 1 FROM window_releases WHERE window_start = %s AND key = %s",
+            (window_start, key),
+        )
+        ever_released = cur.fetchone() is not None
+        publish = should_deliver(gate_open, ever_released, nxt["status"])
+        if not publish:
+            log.info("window=%d key=%s -> v%d (%s, %s) HELD (not released externally)",
+                     window_start, key, nxt["version"], nxt["status"], reason)
+            return True
+        if not ever_released:
+            # First external publication: the release ledger row is born in the
+            # same transaction as the deliveries — one-shot, insert-only, never
+            # revocable by closing the gate.
+            cur.execute(
+                """INSERT INTO window_releases
+                       (window_start, window_end, key, result_version, action)
+                   VALUES (%s, %s, %s, %s, 'GATE_OPEN')""",
+                (window_start, window_end, key, nxt["version"]),
+            )
+            cur.execute(
+                """INSERT INTO release_actions (key, action, window_start, result_version, windows)
+                   VALUES (%s, 'GATE_OPEN', %s, %s, %s)""",
+                (key, window_start, nxt["version"],
+                 psycopg2.extras.Json([{"window_start": window_start,
+                                        "window_end": window_end,
+                                        "version": nxt["version"]}])),
+            )
         # Outbox fan-out. kind tells the downstream how to book this version:
         # NEW = first sight of the result, CORRECTION = amend the same
         # (window, key) booking (never a new success), WITHDRAWAL = reverse it.
-        kind = delivery_kind(reason, nxt["status"])
+        # A held window's first release is NEW regardless of its internal reason.
+        kind = "NEW" if not ever_released else delivery_kind(reason, nxt["status"])
         cur.execute(
             """INSERT INTO deliveries (subscriber_id, window_start, window_end, key,
                                        version, kind, payload)
@@ -677,6 +796,162 @@ def tick(conn):
 
 
 # ---------------------------------------------------------------------------
+# external release (对外放行)
+# ---------------------------------------------------------------------------
+# Internal results exist as soon as they are computed, but they are only given
+# externally through here. Two operations, both per business key:
+#
+# release_key   — one-shot: publish exactly the windows of this key that are
+#                 computed but have never been released (or just the requested
+#                 subset). Each window goes out at the version that is head AT
+#                 RELEASE TIME; intermediate versions held internally are
+#                 skipped, not sent. Gate state is unchanged.
+# set_gate      — flip the key's switch. Opening flushes that same backlog
+#                 atomically and lets later first versions flow by themselves;
+#                 closing only holds back windows that have never been out —
+#                 corrections/withdrawals of released windows keep flowing, and
+#                 release-ledger rows are never deleted.
+#
+# Both serialize against emit() for the key via the release_gates row lock, so
+# a late event landing during a release can never split "the version at release
+# time" between the ledger and the outbox.
+
+def held_heads(cur, key):
+    """Live-or-empty head results of ``key`` that have never been externally
+    released. Status is the head status as emitted (payload null = RETRACTED)."""
+    cur.execute(
+        """SELECT r.window_start, r.window_end, r.version, r.payload
+           FROM results r
+           WHERE r.key = %s
+             AND r.status IN ('CURRENT', 'RETRACTED')
+             AND NOT EXISTS (
+                 SELECT 1 FROM window_releases w
+                 WHERE w.window_start = r.window_start AND w.key = r.key
+             )
+           ORDER BY r.window_start""",
+        (key,),
+    )
+    return cur.fetchall()
+
+
+def publish_heads(cur, key, rows, action):
+    """Create release ledger rows + outbox deliveries for the given held heads.
+
+    Runs inside the caller's transaction (which already holds the key's gate
+    lock). Only live heads are published — a fully-retracted window that never
+    went out releases nothing (a later revival releases it as the first NEW).
+    Returns the [{"window_start", "window_end", "version"}] list released and
+    writes one summary release_actions row.
+    """
+    released = []
+    for ws, we, version, payload in rows:
+        if payload is None:
+            continue  # fully retracted and never out: nothing to release
+        cur.execute(
+            """INSERT INTO window_releases
+                   (window_start, window_end, key, result_version, action)
+               VALUES (%s, %s, %s, %s, %s)
+               ON CONFLICT (window_start, key) DO NOTHING""",
+            (ws, we, key, version, action),
+        )
+        cur.execute(
+            """INSERT INTO deliveries (subscriber_id, window_start, window_end, key,
+                                       version, kind, payload)
+               SELECT s.id, %s, %s, %s, %s, 'NEW', %s FROM subscribers s
+               ON CONFLICT (subscriber_id, window_start, key, version) DO NOTHING""",
+            (ws, we, key, version, psycopg2.extras.Json(payload)),
+        )
+        released.append({"window_start": ws, "window_end": we, "version": version})
+    if released:
+        cur.execute(
+            """INSERT INTO release_actions (key, action, window_start, result_version, windows)
+               VALUES (%s, %s, NULL, NULL, %s)""",
+            (key, action, psycopg2.extras.Json(released)),
+        )
+    return released
+
+
+def release_key(conn, key, window_starts=None):
+    """One-shot external release for one business key.
+
+    Publishes exactly the key's windows that are computed but have never been
+    released — or the requested subset — each at the version that is head at
+    this moment. Gate state is untouched: a later click releases only windows
+    that are still held. Idempotent: an already-released window is not sent
+    twice (it simply isn't in the held set anymore); a held window whose head
+    is fully retracted releases nothing.
+    """
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO release_gates (key) VALUES (%s) ON CONFLICT (key) DO NOTHING",
+            (key,),
+        )
+        cur.execute("SELECT 1 FROM release_gates WHERE key = %s FOR UPDATE", (key,))
+        cur.fetchone()  # row was just ensured above; the lock serializes with emit()
+        rows = held_heads(cur, key)
+        if window_starts is not None:
+            wanted = set(window_starts)
+            chosen = [r for r in rows if r[0] in wanted]
+            found = {r[0] for r in rows}
+            unknown = sorted(wanted - found)
+            if unknown:
+                raise HTTPException(
+                    409,
+                    f"window(s) {unknown} for key {key!r} are not releasable now "
+                    "(already released, not computed, or fully retracted)")
+        else:
+            chosen = rows
+        released = publish_heads(cur, key, chosen, "RELEASE")
+    log.info("release key=%s windows=%d versions=%s", key, len(released),
+             [w["version"] for w in released])
+    return released
+
+
+def set_gate(conn, key, open_):
+    """Open or close a key's external release switch.
+
+    Opening flushes the current held backlog atomically and is idempotent
+    (a repeat open finds nothing held). Closing only affects windows that have
+    never been released: released windows' corrections/withdrawals keep
+    flowing, and the ledger is never deleted — nothing out is reclaimed.
+    """
+    action = "GATE_OPEN" if open_ else "GATE_CLOSE"
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO release_gates (key, open, opened_at, closed_at)
+               VALUES (%s, %s, now(), CASE WHEN %s THEN NULL ELSE now() END)
+               ON CONFLICT (key) DO UPDATE
+                   SET open = EXCLUDED.open,
+                       opened_at = CASE WHEN EXCLUDED.open THEN now()
+                                        ELSE release_gates.opened_at END,
+                       closed_at = CASE WHEN EXCLUDED.open THEN NULL ELSE now() END,
+                       updated_at = now()""",
+            (key, open_, open_),
+        )
+        cur.execute("SELECT 1 FROM release_gates WHERE key = %s FOR UPDATE", (key,))
+        cur.fetchone()
+        released = []
+        if open_:
+            released = publish_heads(cur, key, held_heads(cur, key), "GATE_OPEN")
+            if not released:
+                # an open click with an empty backlog still leaves a trace
+                cur.execute(
+                    """INSERT INTO release_actions (key, action, window_start, result_version, windows)
+                       VALUES (%s, 'GATE_OPEN', NULL, NULL, '[]'::jsonb)""",
+                    (key,),
+                )
+        else:
+            cur.execute(
+                """INSERT INTO release_actions (key, action, window_start, result_version, windows)
+                   VALUES (%s, 'GATE_CLOSE', NULL, NULL, '[]'::jsonb)""",
+                (key,),
+            )
+    log.info("gate key=%s -> %s (flushed %d held windows)", key,
+             "OPEN" if open_ else "CLOSED", len(released))
+    return released
+
+
+# ---------------------------------------------------------------------------
 # delivery dispatcher (transactional outbox)
 # ---------------------------------------------------------------------------
 
@@ -877,13 +1152,21 @@ def watermark_history(stream: Optional[str] = None, limit: int = 100):
 
 @app.get("/results/current")
 def results_current(window_start: Optional[int] = None, key: Optional[str] = None):
-    """Head version of results. With window_start+key, returns a single result."""
+    """Head version of results. With window_start+key, returns a single result.
+
+    ``released`` says whether this (window, key) has been given externally at
+    least once — a held result is computed, audited and queryable, but has no
+    outbox deliveries yet."""
     conn = connect()
     try:
         with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                """SELECT DISTINCT ON (window_start, key) *
-                   FROM results ORDER BY window_start, key, version DESC"""
+                """SELECT DISTINCT ON (r.window_start, r.key) r.*,
+                          (w.window_start IS NOT NULL) AS released
+                   FROM results r
+                   LEFT JOIN window_releases w
+                     ON w.window_start = r.window_start AND w.key = r.key
+                   ORDER BY r.window_start, r.key, r.version DESC"""
             )
             heads = cur.fetchall()
     finally:
@@ -893,6 +1176,8 @@ def results_current(window_start: Optional[int] = None, key: Optional[str] = Non
         heads = [h for h in heads if h["window_start"] == window_start]
     if key is not None:
         heads = [h for h in heads if h["key"] == key]
+    for h in heads:
+        h["released"] = bool(h["released"])
     if window_start is not None and key is not None:
         return {"result": heads[0] if heads else None}
     return {"results": heads}
@@ -966,10 +1251,17 @@ def windows():
                 )
                 rows = cur.fetchall()
                 cur.execute(
-                    """SELECT DISTINCT ON (window_start, key) window_start, key, version, status
-                       FROM results ORDER BY window_start, key, version DESC"""
+                    """SELECT DISTINCT ON (r.window_start, r.key)
+                              r.window_start, r.key, r.version, r.status,
+                              (w.window_start IS NOT NULL) AS released
+                       FROM results r
+                       LEFT JOIN window_releases w
+                         ON w.window_start = r.window_start AND w.key = r.key
+                       ORDER BY r.window_start, r.key, r.version DESC"""
                 )
                 heads = {(r["window_start"], r["key"]): r for r in cur.fetchall()}
+                cur.execute("SELECT key, open FROM release_gates")
+                gates = {r[0]: r[1] for r in cur.fetchall()}
     finally:
         conn.close()
     values = [i["watermark"] for i in wms.values()]
@@ -989,6 +1281,8 @@ def windows():
             "closed": window_ready(marks["a"], marks["b"], ws + WINDOW_MS),
             "head_version": head["version"] if head else None,
             "head_status": head["status"] if head else None,
+            "released": bool(head and head["released"]),
+            "gate_open": gates.get(r["key"], False),
         })
     return {"windows": out, "min_watermark": min_wm}
 
@@ -1083,6 +1377,149 @@ def orders_history(key: str):
     finally:
         conn.close()
     return {"order": order, "versions": versions}
+
+
+# ---------------------------------------------------------------------------
+# external release gate (对外放行)
+# ---------------------------------------------------------------------------
+
+class ReleaseIn(BaseModel):
+    key: str = Field(min_length=1, max_length=200)
+    window_starts: Optional[list[int]] = Field(
+        default=None,
+        description="only release these held windows; default = every computed-"
+                    "but-unreleased window of this key")
+
+
+class GateIn(BaseModel):
+    key: str = Field(min_length=1, max_length=200)
+    open: bool
+
+
+@app.post("/releases")
+def release(body: ReleaseIn):
+    """One-shot external release for ONE business key.
+
+    Sends exactly the version that is head now for each still-unreleased,
+    currently-live window of the key (intermediate held versions are skipped,
+    not sent). Other keys stay held; windows fully retracted before ever being
+    released send nothing. Releasing the same key again only flushes windows
+    that are still held — what already went out is never taken back.
+    """
+    ws = body.window_starts
+    if ws is not None:
+        if not ws:
+            raise HTTPException(422, "window_starts must be non-empty when given")
+        if len(ws) != len(set(ws)):
+            raise HTTPException(422, "window_starts must not repeat windows")
+    conn = connect()
+    try:
+        released = release_key(conn, body.key, ws)
+    finally:
+        conn.close()
+    return {"key": body.key, "released": released,
+            "count": len(released)}
+
+
+@app.post("/release-gates")
+def gate(body: GateIn):
+    """Open/close the per-key release switch.
+
+    Opening immediately flushes the key's current held backlog (at its current
+    heads) and lets subsequent first versions flow on their own; closing holds
+    back only windows that have never been released — corrections and
+    withdrawals of released windows keep being delivered, and the open/close
+    history is recorded, never reclaimed.
+    """
+    conn = connect()
+    try:
+        released = set_gate(conn, body.key, body.open)
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM release_gates WHERE key = %s", (body.key,))
+            gate_row = cur.fetchone()
+    finally:
+        conn.close()
+    return {"gate": gate_row, "released": released, "count": len(released)}
+
+
+@app.get("/release-gates")
+def release_gates_list(key: Optional[str] = None):
+    """Per-key gate state plus counters of held (computed but not released)
+    windows and windows already given externally."""
+    sql = """
+    SELECT g.key, g.open, g.opened_at, g.closed_at, g.updated_at,
+           (SELECT count(*) FROM window_releases w WHERE w.key = g.key) AS released_windows,
+           (SELECT count(*) FROM results r
+             WHERE r.key = g.key AND r.status IN ('CURRENT','RETRACTED')
+               AND NOT EXISTS (SELECT 1 FROM window_releases w
+                               WHERE w.window_start = r.window_start AND w.key = r.key))
+             AS held_windows
+    FROM release_gates g"""
+    args = []
+    if key is not None:
+        sql += " WHERE g.key = %s"
+        args.append(key)
+    sql += " ORDER BY g.key"
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, args)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {"gates": rows}
+
+
+@app.get("/releases/backlog")
+def release_backlog(key: Optional[str] = None):
+    """What the gate is currently holding: the head version of every computed
+    window with no external release yet (live heads are releasable now; heads
+    retracted while held send nothing until they revive)."""
+    sql = """
+    SELECT r.key, r.window_start, r.window_end, r.version, r.status,
+           g.open AS gate_open,
+           (r.payload IS NOT NULL) AS releasable_now
+    FROM results r
+    JOIN release_gates g ON g.key = r.key
+    WHERE r.status IN ('CURRENT','RETRACTED')
+      AND NOT EXISTS (SELECT 1 FROM window_releases w
+                      WHERE w.window_start = r.window_start AND w.key = r.key)"""
+    args = []
+    if key is not None:
+        sql += " AND r.key = %s"
+        args.append(key)
+    sql += " ORDER BY r.key, r.window_start"
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, args)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {"held": rows}
+
+
+@app.get("/releases/history")
+def release_history(key: str, limit: int = Query(default=100)):
+    """Audit of every release action for a key (explicit releases, gate-open
+    flushes, gate closes) plus the immutable per-window release ledger."""
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM release_actions WHERE key = %s ORDER BY id DESC LIMIT %s",
+                (key, min(max(limit, 1), 1000)),
+            )
+            actions = cur.fetchall()
+            cur.execute(
+                """SELECT window_start, window_end, result_version, action, released_at
+                   FROM window_releases WHERE key = %s ORDER BY window_start""",
+                (key,),
+            )
+            ledger = cur.fetchall()
+    finally:
+        conn.close()
+    return {"key": key, "actions": actions, "released_windows": ledger}
 
 
 # ---------------------------------------------------------------------------
@@ -1219,6 +1656,12 @@ def result_delivery(window_start: int, key: str):
                 (window_start, key),
             )
             rows = cur.fetchall()
+            cur.execute(
+                """SELECT result_version, action, released_at FROM window_releases
+                   WHERE window_start = %s AND key = %s""",
+                (window_start, key),
+            )
+            released = cur.fetchone()
     finally:
         conn.close()
     by_sub = {}
@@ -1238,4 +1681,7 @@ def result_delivery(window_start: int, key: str):
                 break
             sub["delivered_up_to"] = v["version"]
     return {"window_start": window_start, "key": key,
+            "released": released is not None,
+            "released_version": released["result_version"] if released else None,
+            "released_at": released["released_at"] if released else None,
             "subscribers": list(by_sub.values())}

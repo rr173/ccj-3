@@ -6,8 +6,8 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "services", "aligner"))
 
 from app.core import (compute_payload, decide, delivery_kind, effective,  # noqa: E402
-                      payload_hash, retry_delay_ms, side_evidence, window_of,
-                      window_ready)
+                      payload_hash, releasable, retry_delay_ms, should_deliver,
+                      side_evidence, window_of, window_ready)
 
 W = 30_000
 
@@ -223,6 +223,44 @@ class TestWindowReady(unittest.TestCase):
         a = self.mark(self.END, "idle_timeout", has_data=True)
         b = self.mark(self.END, "idle_timeout")            # no data on this side
         self.assertFalse(window_ready(a, b, self.END))
+
+
+class TestShouldDeliver(unittest.TestCase):
+    """The per-key external release gate sitting between a committed internal
+    version and the delivery outbox."""
+
+    def test_held_while_gate_closed_and_never_released(self):
+        # computed and queryable, but not given externally
+        self.assertFalse(should_deliver(False, False, "CURRENT"))
+
+    def test_flows_when_gate_open_and_never_released(self):
+        self.assertTrue(should_deliver(True, False, "CURRENT"))
+
+    def test_retracted_while_held_sends_nothing(self):
+        # the outside world never knew it: nothing to withdraw
+        self.assertFalse(should_deliver(True, False, "RETRACTED"))
+        self.assertFalse(should_deliver(False, False, "RETRACTED"))
+
+    def test_released_window_keeps_flowing_after_gate_closes(self):
+        # corrections and withdrawals are never swallowed by a closed gate
+        self.assertTrue(should_deliver(False, True, "CURRENT"))
+        self.assertTrue(should_deliver(False, True, "RETRACTED"))
+        self.assertTrue(should_deliver(True, True, "CURRENT"))
+        self.assertTrue(should_deliver(True, True, "RETRACTED"))
+
+
+class TestReleasable(unittest.TestCase):
+    def test_live_held_head_is_releasable(self):
+        self.assertTrue(releasable("CURRENT", False))
+
+    def test_already_released_is_not_releasable_again(self):
+        # what went out can never be taken back or re-sent as new
+        self.assertFalse(releasable("CURRENT", True))
+        self.assertFalse(releasable("RETRACTED", True))
+
+    def test_retracted_held_head_is_not_releasable(self):
+        # fully withdrawn before ever going out: a later revival releases as NEW
+        self.assertFalse(releasable("RETRACTED", False))
 
 
 class TestRetryDelay(unittest.TestCase):

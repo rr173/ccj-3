@@ -62,13 +62,23 @@ curl -sf "$R/results/current?window_start=$WS&key=order-1" | json
 say "2. duplicate delivery is deduped, never double-counted"
 post "$A/events" '{"event_id":"a1","event_time":'"$((WS+1000))"',"key":"order-1","payload":{"amount":100}}' | json
 
-say "3. both watermarks pass the window -> INITIAL result"
+say "3. both watermarks pass the window -> INITIAL result (held: computed but not released)"
 post "$A/events" '{"event_id":"a-hb","event_time":'"$PUSH"',"key":"__hb__"}' >/dev/null
 post "$B/events" '{"events":[
   {"event_id":"b2","event_time":'"$((WS+2500))"',"key":"order-1","payload":{"ship":"UPS"}},
   {"event_id":"b-hb","event_time":'"$PUSH"',"key":"__hb__"}]}' >/dev/null
 wait_version "$WS" order-1 1
-curl -sf "$R/results/current?window_start=$WS&key=order-1" | json
+echo "internal result exists, released=false and the outbox is empty:"
+curl -sf "$R/results/current?window_start=$WS&key=order-1" | field "{'version': d['result']['version'], 'released': d['result']['released']}"
+curl -sf "$R/deliveries?window_start=$WS&key=order-1" | field "len(d['deliveries'])"
+
+say "3b. one-shot external release of order-1: the then-current head goes out as NEW"
+post "$R/releases" '{"key":"order-1"}' | json
+sleep 2
+echo "released=true, one NEW delivery pushed, held backlog is empty:"
+curl -sf "$R/results/delivery?window_start=$WS&key=order-1" \
+  | field "{released: d['released'], released_version: d['released_version'], ups: {s['subscriber']: s['delivered_up_to'] for s in d['subscribers']}}"
+curl -sf "$R/releases/backlog?key=order-1" | field "len(d['held'])"
 
 say "4. LATE event for the already-closed window -> correction v2"
 post "$B/events" '{"event_id":"b3-late","event_time":'"$((WS+500))"',"key":"order-1","payload":{"ship":"late"}}' | json
@@ -104,6 +114,40 @@ wait_version "$WS" order-1 4
 curl -sf "$R/audit?window_start=$WS&key=order-1" | json
 post "$A/watermark/override" '{"watermark":null}' >/dev/null
 echo "override cleared"
+
+say "9b. release gate on a fresh key: held -> open/flush -> close holds new windows, released ones keep flowing"
+GKEY="order-gate"
+GWS=$(( $(python3 -c 'import time; print(int(time.time()*1000))') / WINDOW_MS * WINDOW_MS ))
+GPUSH=$(( GWS + WINDOW_MS + 8000 ))
+post "$A/watermark/override" '{"watermark":null}' >/dev/null
+post "$B/watermark/override" '{"watermark":null}' >/dev/null
+post "$A/events" '{"events":[
+  {"event_id":"g-a1","event_time":'"$((GWS+1000))"',"key":"'"$GKEY"'","payload":{"n":1}},
+  {"event_id":"g-a-hb","event_time":'"$GPUSH"',"key":"__hb__"}]}' >/dev/null
+post "$B/events" '{"events":[
+  {"event_id":"g-b1","event_time":'"$((GWS+1500))"',"key":"'"$GKEY"'","payload":{"s":"x"}},
+  {"event_id":"g-b-hb","event_time":'"$GPUSH"',"key":"__hb__"}]}' >/dev/null
+wait_version "$GWS" "$GKEY" 1
+echo "gate defaults closed: result computed (queryable) but held, nothing pushed:"
+curl -sf "$R/releases/backlog?key=$GKEY" | json
+post "$A/events" '{"event_id":"g-a2-late","event_time":'"$((GWS+600))"',"key":"'"$GKEY"'","payload":{"n":2}}' >/dev/null
+wait_version "$GWS" "$GKEY" 2
+echo "a late event while held moved the internal head to v2 (v1 never goes out):"
+curl -sf "$R/releases/backlog?key=$GKEY" | field "[(h['version'], h['releasable_now']) for h in d['held']]"
+post "$R/release-gates" '{"key":"'"$GKEY"'","open":true}' | json
+sleep 2
+echo "opening flushed the head at THAT moment — first delivery is NEW v2, not v1:"
+curl -sf "$R/results/delivery?window_start=$GWS&key=$GKEY" \
+  | field "{ups: {s['subscriber']: s['delivered_up_to'] for s in d['subscribers']}, released_version: d['released_version']}"
+post "$R/release-gates" '{"key":"'"$GKEY"'","open":false}' | json
+post "$B/events" '{"event_id":"g-b2-late","event_time":'"$((GWS+700))"',"key":"'"$GKEY"'","payload":{"s":"y"}}' >/dev/null
+wait_version "$GWS" "$GKEY" 3
+sleep 2
+echo "gate closed AFTER release: v3 correction still delivered, gate state does not swallow it:"
+curl -sf "$R/results/delivery?window_start=$GWS&key=$GKEY" \
+  | field "{ups: {s['subscriber']: s['delivered_up_to'] for s in d['subscribers']}}"
+echo "release actions recorded for the key:"
+curl -sf "$R/releases/history?key=$GKEY" | field "[(a['action'], a['windows']) for a in d['actions']]"
 
 say "10. downstream delivery: every version pushed in order, corrections flagged"
 echo "waiting for the delivery queue to drain..."
