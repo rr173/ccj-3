@@ -6,7 +6,8 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "services", "aligner"))
 
 from app.core import (compute_payload, decide, delivery_kind, effective,  # noqa: E402
-                      payload_hash, retry_delay_ms, window_of)
+                      payload_hash, retry_delay_ms, side_evidence, window_of,
+                      window_ready)
 
 W = 30_000
 
@@ -124,6 +125,80 @@ class TestDeliveryKind(unittest.TestCase):
     def test_revival_after_withdrawal_is_correction_not_new(self):
         # a result coming back after being withdrawn must amend, not double-book
         self.assertEqual(delivery_kind("LATE_EVENT", "CURRENT"), "CORRECTION")
+
+
+class TestSideEvidence(unittest.TestCase):
+    """Per-(key, stream) crossing evidence for the per-key emission gate."""
+    END = 60_000
+
+    def mark(self, watermark=None, source=None, key_max=None):
+        return {"watermark": watermark, "source": source,
+                "key_max_event_time": key_max}
+
+    def test_own_progress_crosses_without_any_watermark(self):
+        # the key itself has an event beyond the window end: it has moved on
+        self.assertEqual(side_evidence(self.mark(key_max=self.END), self.END),
+                         "own_progress")
+        self.assertEqual(side_evidence(self.mark(key_max=self.END + 1), self.END),
+                         "own_progress")
+
+    def test_own_progress_before_window_end_does_not_cross(self):
+        self.assertIsNone(side_evidence(self.mark(key_max=self.END - 1), self.END))
+
+    def test_event_time_watermark_crosses(self):
+        self.assertEqual(side_evidence(self.mark(self.END, "event_time"), self.END),
+                         "watermark")
+
+    def test_override_watermark_crosses(self):
+        # the operator override is an explicit promise — also how windows are
+        # forced closed when a stream is gone for good
+        self.assertEqual(side_evidence(self.mark(self.END, "override"), self.END),
+                         "watermark")
+
+    def test_idle_watermark_never_crosses(self):
+        # idle wall-clock advance is not a promise: it must not finalize
+        # businesses still waiting for this side, no matter how far it goes
+        self.assertIsNone(side_evidence(self.mark(100 * self.END, "idle_timeout"),
+                                        self.END))
+
+    def test_no_data_does_not_cross(self):
+        self.assertIsNone(side_evidence(self.mark(None, "no_data"), self.END))
+        self.assertIsNone(side_evidence(self.mark(), self.END))
+
+    def test_short_watermark_does_not_cross(self):
+        self.assertIsNone(side_evidence(self.mark(self.END - 1, "event_time"),
+                                        self.END))
+
+    def test_own_progress_wins_over_watermark_as_evidence(self):
+        m = self.mark(self.END, "event_time", key_max=self.END)
+        self.assertEqual(side_evidence(m, self.END), "own_progress")
+
+
+class TestWindowReady(unittest.TestCase):
+    END = 60_000
+
+    def mark(self, watermark=None, source=None, key_max=None):
+        return {"watermark": watermark, "source": source,
+                "key_max_event_time": key_max}
+
+    def test_ready_only_when_both_sides_cross(self):
+        a = self.mark(key_max=self.END)
+        b = self.mark(key_max=self.END)
+        self.assertTrue(window_ready(a, b, self.END))
+        self.assertFalse(window_ready(a, self.mark(), self.END))
+        self.assertFalse(window_ready(self.mark(), b, self.END))
+        self.assertFalse(window_ready(self.mark(), self.mark(), self.END))
+
+    def test_quiet_business_waits_without_blocking_evidence(self):
+        # one side has never seen this key and its watermark is idle: wait
+        a = self.mark(self.END, "event_time")
+        b = self.mark(100 * self.END, "idle_timeout")
+        self.assertFalse(window_ready(a, b, self.END))
+
+    def test_each_side_may_cross_by_different_evidence(self):
+        a = self.mark(key_max=self.END)                    # own progress
+        b = self.mark(self.END, "event_time")              # stream promise
+        self.assertTrue(window_ready(a, b, self.END))
 
 
 class TestRetryDelay(unittest.TestCase):

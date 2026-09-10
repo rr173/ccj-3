@@ -31,10 +31,10 @@
 - **ingest-a / ingest-b**：同一个镜像、不同环境变量的两次部署。各自持久化事件、
   按 `event_id` 幂等去重、维护**各自的水位**并对外暴露。
 - **aligner**：周期性从两个 ingest 增量拉事件（offset 与写入同事务提交，崩溃重放不重复），
-  仅当**两边水位都越过同一窗口末尾**才产出该窗口的对齐结果；晚到/回撤事件触发**订正**，
-  每次变更落审计。所有查询由 aligner 提供。同时维护一个**事务性 outbox**：每个结果版本
-  落库的同一事务里为每个已登记下游生成投递任务，由内置派发器按版本顺序推送、失败退避
-  重试，不丢、不乱序。
+  按**业务键各自**判定关窗：某 key 的两侧都越过窗口末尾才产出该 (窗口, key) 的对齐结果，
+  各业务互不阻塞；晚到/回撤事件触发**订正**，每次变更落审计。所有查询由 aligner 提供。
+  同时维护一个**事务性 outbox**：每个结果版本落库的同一事务里为每个已登记下游生成投递任务，
+  由内置派发器按版本顺序推送、失败退避重试，不丢、不乱序。
 - **postgres**：一个容器内三个逻辑库（`stream_a` / `stream_b` / `aligner`），服务间不共享表，
   各自可独立重建、迁移、部署。
 
@@ -43,8 +43,9 @@
 | 概念 | 定义 |
 |---|---|
 | 窗口 | 事件时间上的滚动窗口 `[ws, ws+WINDOW_SIZE_MS)`，`ws = floor(event_time / W) * W` |
-| 流水位 | `max(event_time) - WATERMARK_GRACE_MS`；流空闲超过 `IDLE_TIMEOUT_MS` 后按墙钟推进；运维可用 override 强制（含回拨） |
-| 关窗条件 | `min(wm_a, wm_b) >= window_end`。**只有一边越过不算**，两边都越过才产出 INITIAL 结果 |
+| 流水位 | `max(event_time) - WATERMARK_GRACE_MS`；流空闲超过 `IDLE_TIMEOUT_MS` 后按墙钟推进（只作观测，**不参与关窗**）；运维可用 override 强制（含回拨） |
+| 越过窗尾（按业务键各自判定） | key 在某侧"越过"窗尾 = 该 key 本侧有 `event_time ≥ 窗尾` 的事件（**自身进度**），或该侧水位 ≥ 窗尾且来源为 `event_time` / `override`（**真实推进承诺**）。`idle_timeout` 的墙钟水位不算数 |
+| 关窗条件 | 某 (窗口, key) 的**两侧各自都越过**窗尾才产出它的 INITIAL 结果。别的业务没越过不挡它，它没越过也不挡别人；没越过的业务一直等，事件与"未出结果"的状态都在，绝不丢弃 |
 | 对齐规则 | 窗口内同 key 的 A、B 事件按 `(event_time, event_id)` 排序后顺序配对；多余的一侧记入 `unmatched_*`；只有单边数据也出结果 |
 | 晚到事件 | 落在已关窗窗口的事件 → 重算该 (窗口, key)，内容变化则产生新版本（`LATE_EVENT`） |
 | 回撤 | `type=retract, retracts=<event_id>` 删除已收事件 → 重算并产生新版本（`RETRACTION`）；结果清空时版本状态为 `RETRACTED` |
@@ -92,7 +93,7 @@ no-op。
 
 | 状态 | 含义 |
 |---|---|
-| `OPEN`（开着）| 还在收窗：有业务窗（存在有效事件的窗）没进单——要么到点未出结果（`missing`），要么窗还没到点（`pending`）；或有窗被整笔撤回未了结 |
+| `OPEN`（开着）| 还在收窗：有业务窗（存在有效事件的窗）没进单——要么两侧已越过却未出结果（`missing`），要么窗还在等某一侧越过（`pending`）；或有窗被整笔撤回未了结 |
 | `WAITING`（等着）| 窗都齐了，但有的窗还有单边缺口（`unmatched_*` 非空），在等对面 |
 | `CLOSED`（关了）| 各窗都齐、没有被撤未了结的窗、没有还在等对面的缺口——成功单 |
 | `REOPENED`（被重开）| 关过之后被订正/撤回/新窗打开，当前不满足关单条件；**关单后再来订正或整窗撤回，即使改完两边仍对得上，也一律先重开**，后续新结果满足关单条件时才重新 `CLOSED` |
@@ -127,8 +128,9 @@ no-op。
 |---|---|
 | 重复到达 | ingest 按 `event_id` 唯一约束去重，响应里明确返回 `deduped`（不报错、不双算）；aligner 侧 `ON CONFLICT DO NOTHING` + offset 同事务提交，重放是 no-op |
 | 窗口内乱序 | 配对按 `(event_time, event_id)` 排序，乱序不影响结果；重算结果与到达顺序无关（有单测保证） |
-| 一边长时间无事件 | 空闲超过 `IDLE_TIMEOUT_MS` 后该流水位按墙钟推进，窗口照常关闭，单边数据产出带 `unmatched_*` 的结果；从未有过事件的流在启动超时后同样进入空闲推进，不会永久卡住另一边 |
-| 水位被回拨 | override 可把水位调低；aligner 在 `watermark_log` 记录 `regress` 方向并告警，**已产出结果不被悄悄改写或删除**，此后到达的晚到数据仍走订正路径；清除 override 后恢复自动水位 |
+| 某业务一直不来新事件 | 只影响它自己：别的业务两侧证据齐了就出结果，不被它卡住；它自己的 (窗口, key) 一直等，状态不丢，两侧越过的那一刻就出 |
+| 一边长时间无事件 | 空闲超过 `IDLE_TIMEOUT_MS` 后该流水位仍按墙钟推进并如实上报（`idle_timeout`），但**空闲水位不作为越过依据**：还在等这边的业务继续等，不会被误关成单边结果。确认流已停，由运维 override 强制推进 |
+| 水位被回拨 | override 可把水位调低；aligner 在 `watermark_log` 记录 `regress` 方向并告警，**已产出结果不被悄悄改写、删除或重算成"没出过"**，此后到达的晚到数据仍走订正路径；清除 override 后恢复自动水位 |
 | 回撤先于目标到达 | 回撤事件先存下；目标事件到达时即被过滤，不会短暂出现错误结果 |
 | 服务重启 / 崩溃 | ingest 事件落库后才响应；aligner 的 offset 与事件写入同事务，崩溃最多重放未提交尾部且重放为 no-op；结果发版本由内容哈希决定，重启不会重复发版；未完成的投递任务留在 outbox 里，重启后接着投 |
 | 下游不可用 / 返回 500 | 该笔投递标记 `RETRYING` 并记录错误，按指数退避重试，永不放弃；同一结果的后续版本排队等前序成功，其他结果不受影响 |
@@ -152,8 +154,8 @@ python3 tests/test_core.py       # 或 make unit —— 纯逻辑单测，无需
 ```
 
 演示脚本依次验证：正常对齐 → 重复去重 → 双水位关窗 → 晚到订正（v2）→ 回撤订正（v3）→
-历史/审计查询 → 空闲推进 → 水位回拨 + 回拨期间继续订正（v4）→ 下游订阅登记、
-按版本顺序推送（NEW / CORRECTION）与投递状态查询 → 业务单全生命周期
+历史/审计查询 → 空闲推进（水位照走但不关死等待中的业务）→ 水位回拨 + 回拨期间继续订正（v4）→
+下游订阅登记、按版本顺序推送（NEW / CORRECTION）与投递状态查询 → 业务单全生命周期
 （开着 → 等着 → 关了 → 被重开 → 作废 → 同一张单复活）。
 
 ## API 一览
@@ -185,7 +187,7 @@ python3 tests/test_core.py       # 或 make unit —— 纯逻辑单测，无需
 | `GET /results/history?window_start=&key=` | 该结果的全部版本 + 审计记录（"为什么被改过"） |
 | `GET /results/delivery?window_start=&key=` | 该结果的投递阶梯：每个下游哪一版已送达、哪一版还在重试、`delivered_up_to` |
 | `GET /audit?window_start=&key=` | 全局审计流（INITIAL / LATE_EVENT / RETRACTION） |
-| `GET /watermarks` | 两边当前水位与 `min_watermark` |
+| `GET /watermarks` | 两边当前水位、来源（`event_time` / `idle_timeout` / `override` / `no_data`）与 `min_watermark` |
 | `GET /watermarks/history?stream=` | 水位变更历史，含 `advance` / `regress` 方向 |
 | `GET /windows` | 所有已知 (窗口, key) 的状态：是否关窗、head 版本、事件数 |
 | `GET /orders?status=&key=` | 业务单当前状态（`OPEN`/`WAITING`/`CLOSED`/`REOPENED`/`VOID`）及各窗统计；`CLOSED` 即成功单 |
@@ -204,7 +206,7 @@ python3 tests/test_core.py       # 或 make unit —— 纯逻辑单测，无需
 | `STREAM_NAME` | ingest | — | 流名（`a` / `b`） |
 | `DATABASE_DSN` | 全部 | — | 各自独立的库 |
 | `WATERMARK_GRACE_MS` | ingest | 60000 | 水位宽限（允许乱序程度） |
-| `IDLE_TIMEOUT_MS` | ingest | 300000 | 空闲多久后水位按墙钟推进 |
+| `IDLE_TIMEOUT_MS` | ingest | 300000 | 空闲多久后水位按墙钟推进（只上报，不作为关窗依据） |
 | `WINDOW_SIZE_MS` | aligner | 60000 | 滚动窗口大小 |
 | `POLL_INTERVAL_MS` | aligner | 1000 | 拉取/关窗周期 |
 | `PULL_BATCH_SIZE` | aligner | 500 | 单次拉取批量 |
@@ -218,6 +220,15 @@ compose 中演示配置为：窗口 30s、宽限 5s、空闲超时 20s，便于�
 
 ## 设计取舍与限制
 
+- **按业务键各自关窗**：关窗判定只看该 key 自己两侧的证据（自身有更新事件，或该侧水位
+  真实越过），不用全局 `min(水位)` 一刀切——一个业务静默不会卡住其他业务，其他业务
+  也不会"顺带"把它关死。代价是同一窗口内不同 key 的结果产出时刻不再同步；查询本就按
+  (窗口, key) 组织，无影响。另一个推论：一批业务的"最后一窗"（之后整个流都安静了）会
+  保持未关，直到任意一侧来新事件把真实水位推过窗尾，或运维 override——这是下一条的
+  直接代价。
+- **空闲水位不关窗**：`idle_timeout` 推进的水位是墙钟猜测而非数据承诺，拿它关窗会把
+  "还在等对面"的业务误判成单边完结。所以空闲流只上报水位、不参与关窗；确认流已停的
+  逃生门是 `POST /watermark/override`（显式的人为承诺）。
 - **拉模式 + 单调 seq**：aligner 周期性从 ingest 拉事件而非消息队列。少一个组件，
   语义等价（offset 即消费位点），重放天然幂等。要换 Kafka 只需替换 ingest 的存储层，
   对齐语义不变。

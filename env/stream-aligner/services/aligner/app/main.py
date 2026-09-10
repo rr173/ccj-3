@@ -1,11 +1,17 @@
 """Alignment service.
 
 Continuously pulls both ingest streams, maintains a per-stream watermark, and
-emits aligned business results per (window, key) once *both* watermarks have
-passed the window end. Late events and retractions recompute already-emitted
-windows and produce new, fully audited versions — old versions are kept, never
-overwritten. All recomputation is idempotent: identical content never yields a
-new version, so replays and restarts cannot double-count.
+emits aligned business results per (window, key) once *that key's own two
+sides* have both crossed the window end — each side crosses either by the
+key's own newer events or by a real (non-idle) watermark promise. The gate is
+per business key: one quiet business never stalls the others, a slow business
+simply keeps waiting (never dropped), and an idle stream's wall-clock
+watermark never finalizes businesses still waiting. Late events and
+retractions recompute already-emitted windows and produce new, fully audited
+versions — old versions are kept, never overwritten, and a watermark
+regression can never un-emit them. All recomputation is idempotent: identical
+content never yields a new version, so replays and restarts cannot
+double-count.
 
 Every emitted version is also fanned out to registered downstreams via a
 transactional outbox: the delivery rows are inserted in the same transaction
@@ -31,7 +37,7 @@ from pydantic import BaseModel, Field
 
 from app.core import (ORDER_STATUSES, build_order_snapshot, compute_payload,
                       decide, delivery_kind, evaluate_order, order_reason,
-                      retry_delay_ms, window_of)
+                      retry_delay_ms, side_evidence, window_of, window_ready)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -74,6 +80,9 @@ CREATE TABLE IF NOT EXISTS watermarks (
     watermark  BIGINT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- The per-key emission gate needs to know whether a watermark is a real
+-- progress promise (event_time / override) or idle wall-clock advancement.
+ALTER TABLE watermarks ADD COLUMN IF NOT EXISTS source TEXT;
 CREATE TABLE IF NOT EXISTS watermark_log (
     id            BIGSERIAL PRIMARY KEY,
     stream        TEXT NOT NULL,
@@ -371,42 +380,87 @@ def pull_stream(conn, stream, base_url):
 def refresh_watermarks(conn):
     for stream, base_url in INGESTS.items():
         info = http_get(f"{base_url}/watermark")
-        new_wm = info["watermark"]
+        new_wm, new_src = info["watermark"], info.get("source")
         with conn, conn.cursor() as cur:
-            cur.execute("SELECT watermark FROM watermarks WHERE stream = %s", (stream,))
+            cur.execute("SELECT watermark, source FROM watermarks WHERE stream = %s",
+                        (stream,))
             row = cur.fetchone()
-            old_wm = row[0] if row else None
-            if old_wm == new_wm:
+            old_wm, old_src = (row[0], row[1]) if row else (None, None)
+            if old_wm == new_wm and old_src == new_src:
                 continue
-            if old_wm is not None and (new_wm is None or new_wm < old_wm):
-                direction = "regress"
-                log.warning("stream %s watermark regressed: %s -> %s", stream, old_wm, new_wm)
-            else:
-                direction = "advance"
+            if old_wm != new_wm:
+                if old_wm is not None and (new_wm is None or new_wm < old_wm):
+                    direction = "regress"
+                    log.warning("stream %s watermark regressed: %s -> %s",
+                                stream, old_wm, new_wm)
+                else:
+                    direction = "advance"
+                cur.execute(
+                    "INSERT INTO watermark_log (stream, old_watermark, new_watermark, direction) VALUES (%s, %s, %s, %s)",
+                    (stream, old_wm, new_wm, direction),
+                )
             cur.execute(
-                "INSERT INTO watermark_log (stream, old_watermark, new_watermark, direction) VALUES (%s, %s, %s, %s)",
-                (stream, old_wm, new_wm, direction),
-            )
-            cur.execute(
-                """INSERT INTO watermarks (stream, watermark) VALUES (%s, %s)
+                """INSERT INTO watermarks (stream, watermark, source) VALUES (%s, %s, %s)
                    ON CONFLICT (stream) DO UPDATE SET watermark = EXCLUDED.watermark,
+                                                      source = EXCLUDED.source,
                                                       updated_at = now()""",
-                (stream, new_wm),
+                (stream, new_wm, new_src),
             )
 
 
 def current_watermarks(cur):
-    cur.execute("SELECT stream, watermark FROM watermarks")
-    return {stream: wm for stream, wm in cur.fetchall()}
+    """{stream: {"watermark", "source"}} — the source decides whether the
+    watermark may serve as crossing evidence (see core.side_evidence)."""
+    cur.execute("SELECT stream, watermark, source FROM watermarks")
+    return {stream: {"watermark": wm, "source": src}
+            for stream, wm, src in cur.fetchall()}
+
+
+def key_max_event_times(cur, key=None):
+    """Latest event_time seen per key and stream: each key's own progress on
+    each side. Retracts count too — any event shows the business acted on
+    that stream at that time."""
+    sql = "SELECT key, stream, MAX(event_time) FROM stream_events"
+    args = []
+    if key is not None:
+        sql += " WHERE key = %s"
+        args.append(key)
+    sql += " GROUP BY key, stream"
+    cur.execute(sql, args)
+    out = {}
+    for k, stream, mx in cur.fetchall():
+        out.setdefault(k, {})[stream] = mx
+    return out
+
+
+def emission_marks(wms, key_max, key):
+    """Per-stream crossing evidence for one business key (core.side_evidence)."""
+    marks = {}
+    for stream in INGESTS:
+        info = wms.get(stream) or {}
+        marks[stream] = {
+            "watermark": info.get("watermark"),
+            "source": info.get("source"),
+            "key_max_event_time": key_max.get(key, {}).get(stream),
+        }
+    return marks
 
 
 def close_windows(conn):
-    """Emit INITIAL results for windows both watermarks have passed."""
+    """Emit INITIAL results for (window, key) pairs whose own two sides have
+    both crossed the window end.
+
+    The gate is per business key: one quiet business cannot stall the
+    others; a slow business simply keeps waiting — its events and the
+    absence of a result are the waiting state, re-evaluated every tick,
+    never dropped; and an idle stream's wall-clock watermark never
+    finalizes a business still waiting for that side. Already-emitted
+    results are never revisited here, so a watermark regression cannot
+    un-emit them.
+    """
     with conn.cursor() as cur:
         wms = current_watermarks(cur)
-        if len(wms) < len(INGESTS) or any(w is None for w in wms.values()):
-            return
-        min_wm = min(wms.values())
+        key_max = key_max_event_times(cur)
         cur.execute(
             """SELECT DISTINCT key, (event_time / %s) * %s AS ws
                FROM stream_events WHERE type = 'upsert'""",
@@ -414,12 +468,19 @@ def close_windows(conn):
         )
         candidates = cur.fetchall()
     for key, ws in candidates:
-        if ws + WINDOW_MS > min_wm:
+        end = ws + WINDOW_MS
+        marks = emission_marks(wms, key_max, key)
+        if not window_ready(marks["a"], marks["b"], end):
             continue
         with conn.cursor() as cur:
             head = get_head(cur, ws, key)
         if head is None:
-            emit(conn, ws, key, "INITIAL", {"min_watermark": min_wm})
+            emit(conn, ws, key, "INITIAL", {
+                "side_a": side_evidence(marks["a"], end),
+                "side_b": side_evidence(marks["b"], end),
+                "watermark_a": marks["a"]["watermark"],
+                "watermark_b": marks["b"]["watermark"],
+            })
 
 
 # ---------------------------------------------------------------------------
@@ -451,16 +512,16 @@ def business_windows(cur, key):
 
 
 def order_window_gaps(cur, key, bound):
-    """Unbound business windows, split into missing (due) and pending (not yet)."""
+    """Unbound business windows, split into missing (both sides crossed, so
+    the result is due) and pending (still waiting for at least one side) —
+    the same per-key gate that drives emission."""
     wms = current_watermarks(cur)
-    ready = len(wms) == len(INGESTS) and all(w is not None for w in wms.values())
-    min_wm = min(wms.values()) if ready else None
+    key_max = key_max_event_times(cur, key)
     missing, pending = [], []
     for ws in business_windows(cur, key) - bound:
-        if min_wm is not None and ws + WINDOW_MS <= min_wm:
-            missing.append(ws)
-        else:
-            pending.append(ws)
+        marks = emission_marks(wms, key_max, key)
+        due = window_ready(marks["a"], marks["b"], ws + WINDOW_MS)
+        (missing if due else pending).append(ws)
     return sorted(missing), sorted(pending)
 
 
@@ -487,10 +548,10 @@ def apply_result_to_order(conn, result):
             (key,),
         )
         cur.execute(
-            "SELECT id, head_version, ever_closed, status FROM biz_orders WHERE key = %s",
+            "SELECT id, head_version, ever_closed FROM biz_orders WHERE key = %s",
             (key,),
         )
-        order_id, head_version, ever_closed, head_status = cur.fetchone()
+        order_id, head_version, ever_closed = cur.fetchone()
 
         cur.execute(
             "SELECT result_status FROM biz_order_windows WHERE key = %s AND window_start = %s",
@@ -525,8 +586,7 @@ def apply_result_to_order(conn, result):
         missing, pending = order_window_gaps(cur, key, {b["window_start"] for b in bindings})
         reason = "ORDER_OPENED" if head_version == 0 else order_reason(
             prev[0] if prev else None, result_status)
-        status = evaluate_order(bindings, missing, pending, ever_closed,
-                                head_status, reason)
+        status = evaluate_order(bindings, missing, pending, ever_closed, reason)
         version = head_version + 1
         cur.execute(
             """INSERT INTO biz_order_versions
@@ -756,14 +816,16 @@ def healthz():
 def watermarks():
     conn = connect()
     try:
-        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        with conn, conn.cursor() as cur:
             wms = current_watermarks(cur)
     finally:
         conn.close()
-    ready = len(wms) == len(INGESTS) and all(w is not None for w in wms.values())
+    values = {s: i["watermark"] for s, i in wms.items()}
+    ready = len(values) == len(INGESTS) and all(v is not None for v in values.values())
     return {
-        "streams": wms,
-        "min_watermark": min(wms.values()) if ready else None,
+        "streams": values,
+        "sources": {s: i["source"] for s, i in wms.items()},
+        "min_watermark": min(values.values()) if ready else None,
         "window_size_ms": WINDOW_MS,
     }
 
@@ -859,31 +921,37 @@ def audit_trail(window_start: Optional[int] = None, key: Optional[str] = None,
 
 @app.get("/windows")
 def windows():
-    """All known (window, key) pairs with their alignment state."""
+    """All known (window, key) pairs with their alignment state. ``closed``
+    is per key: both of that key's own sides have crossed the window end."""
     conn = connect()
     try:
-        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            wms = current_watermarks(cur)
-            min_wm = min(wms.values()) if len(wms) == len(INGESTS) and all(
-                w is not None for w in wms.values()) else None
-            cur.execute(
-                """SELECT key, (event_time / %s) * %s AS window_start,
-                          count(*) FILTER (WHERE type = 'upsert') AS upserts,
-                          count(*) FILTER (WHERE type = 'retract') AS retracts
-                   FROM stream_events GROUP BY key, window_start ORDER BY window_start, key""",
-                (WINDOW_MS, WINDOW_MS),
-            )
-            rows = cur.fetchall()
-            cur.execute(
-                """SELECT DISTINCT ON (window_start, key) window_start, key, version, status
-                   FROM results ORDER BY window_start, key, version DESC"""
-            )
-            heads = {(r["window_start"], r["key"]): r for r in cur.fetchall()}
+        with conn:
+            with conn.cursor() as cur:
+                wms = current_watermarks(cur)
+                key_max = key_max_event_times(cur)
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """SELECT key, (event_time / %s) * %s AS window_start,
+                              count(*) FILTER (WHERE type = 'upsert') AS upserts,
+                              count(*) FILTER (WHERE type = 'retract') AS retracts
+                       FROM stream_events GROUP BY key, window_start ORDER BY window_start, key""",
+                    (WINDOW_MS, WINDOW_MS),
+                )
+                rows = cur.fetchall()
+                cur.execute(
+                    """SELECT DISTINCT ON (window_start, key) window_start, key, version, status
+                       FROM results ORDER BY window_start, key, version DESC"""
+                )
+                heads = {(r["window_start"], r["key"]): r for r in cur.fetchall()}
     finally:
         conn.close()
+    values = [i["watermark"] for i in wms.values()]
+    min_wm = min(values) if len(values) == len(INGESTS) and all(
+        v is not None for v in values) else None
     out = []
     for r in rows:
         ws = r["window_start"]
+        marks = emission_marks(wms, key_max, r["key"])
         head = heads.get((ws, r["key"]))
         out.append({
             "window_start": ws,
@@ -891,7 +959,7 @@ def windows():
             "key": r["key"],
             "upserts": r["upserts"],
             "retracts": r["retracts"],
-            "closed": min_wm is not None and ws + WINDOW_MS <= min_wm,
+            "closed": window_ready(marks["a"], marks["b"], ws + WINDOW_MS),
             "head_version": head["version"] if head else None,
             "head_status": head["status"] if head else None,
         })

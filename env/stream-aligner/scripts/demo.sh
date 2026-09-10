@@ -2,9 +2,10 @@
 # End-to-end demo of the stream aligner. Assumes the compose stack is up:
 #   docker compose up -d --build
 # Exercises: normal alignment, duplicates, late-event correction, retraction,
-# idle-stream window closing, watermark regression, the audit trail — and
-# downstream delivery: subscription registration, in-order push of every
-# version (NEW / CORRECTION / WITHDRAWAL), and delivery-status queries.
+# idle-stream watermarking (advances but never closes waiting businesses),
+# watermark regression, the audit trail — and downstream delivery:
+# subscription registration, in-order push of every version (NEW / CORRECTION
+# / WITHDRAWAL), and delivery-status queries.
 set -euo pipefail
 
 A=${INGEST_A_URL:-http://localhost:8001}
@@ -82,10 +83,12 @@ curl -sf "$R/results/current?window_start=$WS&key=order-1" | field "d['result'][
 say "6. WHY did the result change? full history + audit"
 curl -sf "$R/results/history?window_start=$WS&key=order-1" | json
 
-say "7. idle stream: no new events, watermark still advances past new windows"
+say "7. idle stream: watermark advances by wall clock, but must NOT close waiting businesses"
 echo "waiting ~25s for the 20s idle timeout..."
 sleep 25
+echo "watermark source flips to idle_timeout:"
 curl -sf "$A/watermark" | json
+echo "the __hb__ window is still NOT closed — an idle watermark is not a promise:"
 curl -sf "$R/windows" | field "[w for w in d['windows'] if w['key']=='__hb__']" | json
 
 say "8. watermark regression (operator dials stream A back)"

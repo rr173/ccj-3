@@ -17,9 +17,9 @@ def binding(status="CURRENT", has_gap=False, ws=0):
 
 
 def ev_status(bindings, missing=None, pending=None, ever_closed=False,
-              head="OPEN", reason="WINDOW_JOINED"):
+              reason="WINDOW_JOINED"):
     return evaluate_order(bindings, missing or [], pending or [],
-                          ever_closed, head, reason)
+                          ever_closed, reason)
 
 
 class TestEvaluateOrder(unittest.TestCase):
@@ -30,37 +30,62 @@ class TestEvaluateOrder(unittest.TestCase):
     def test_void_wins_even_after_close(self):
         # whole business withdrawn after a close: VOID, never "still closed"
         self.assertEqual(ev_status([binding("RETRACTED")], ever_closed=True,
-                                   head="CLOSED", reason="WINDOW_WITHDRAWN"), "VOID")
+                                   reason="WINDOW_WITHDRAWN"), "VOID")
 
-    def test_correction_on_closed_order_reopens_even_when_still_matched(self):
+    # -- corrections/withdrawals after close never show "still closed" --------
+    def test_correction_after_close_reopens_even_when_still_matched(self):
         # a benign post-close correction must visibly reopen, not stay CLOSED
         self.assertEqual(ev_status([binding()], ever_closed=True,
-                                   head="CLOSED", reason="WINDOW_CORRECTED"), "REOPENED")
+                                   reason="WINDOW_CORRECTED"), "REOPENED")
 
-    def test_partial_withdrawal_on_closed_order_reopens(self):
+    def test_correction_sequence_never_recloses(self):
+        # correct one side, then the other, then more: corrections never
+        # re-close a once-closed order no matter how well it matches
+        for _ in range(3):
+            self.assertEqual(ev_status([binding()], ever_closed=True,
+                                       reason="WINDOW_CORRECTED"), "REOPENED")
+
+    def test_retract_pair_leaving_match_still_reopens(self):
+        # retract one pair of a two-pair window; the rest still matches
+        self.assertEqual(ev_status([binding()], ever_closed=True,
+                                   reason="WINDOW_CORRECTED"), "REOPENED")
+
+    def test_partial_withdrawal_after_close_reopens(self):
         # one window withdrawn, another still live: must not still show CLOSED
         bs = [binding("RETRACTED"), binding(ws=30_000)]
         self.assertEqual(ev_status(bs, ever_closed=True,
-                                   head="CLOSED", reason="WINDOW_WITHDRAWN"), "REOPENED")
+                                   reason="WINDOW_WITHDRAWN"), "REOPENED")
 
-    def test_reclose_when_later_trigger_finds_conditions_met(self):
+    # -- only genuine new business (join / revival) re-closes -----------------
+    def test_join_recloses_when_conditions_met(self):
+        bs = [binding(), binding(ws=30_000)]
+        self.assertEqual(ev_status(bs, ever_closed=True, reason="WINDOW_JOINED"), "CLOSED")
+
+    def test_revival_recloses_when_conditions_met(self):
         self.assertEqual(ev_status([binding()], ever_closed=True,
-                                   head="REOPENED", reason="WINDOW_CORRECTED"), "CLOSED")
+                                   reason="WINDOW_REVIVED"), "CLOSED")
 
+    def test_join_with_gap_does_not_close(self):
+        bs = [binding(), binding(has_gap=True, ws=30_000)]
+        self.assertEqual(ev_status(bs, ever_closed=True, reason="WINDOW_JOINED"), "REOPENED")
+
+    # -- never-closed orders close via corrections normally -------------------
+    def test_correction_closes_never_closed_order(self):
+        self.assertEqual(ev_status([binding()], ever_closed=False,
+                                   reason="WINDOW_CORRECTED"), "CLOSED")
+
+    def test_first_close_via_correction(self):
+        bs = [binding(), binding(ws=30_000)]
+        self.assertEqual(ev_status(bs, ever_closed=False, reason="WINDOW_CORRECTED"), "CLOSED")
+
+    # -- structural conditions -------------------------------------------------
     def test_withdrawn_window_blocks_close(self):
         bs = [binding(), binding("RETRACTED", ws=30_000)]
         self.assertEqual(ev_status(bs, reason="WINDOW_WITHDRAWN"), "OPEN")
 
-    def test_withdrawn_window_blocks_reclose(self):
+    def test_withdrawn_window_blocks_reclose_via_join(self):
         bs = [binding(), binding("RETRACTED", ws=30_000)]
-        self.assertEqual(ev_status(bs, ever_closed=True, head="REOPENED",
-                                   reason="WINDOW_CORRECTED"), "REOPENED")
-
-    def test_join_on_closed_order_is_growth_not_reopen(self):
-        # a new window joining a closed order re-evaluates and may re-close
-        bs = [binding(), binding(ws=30_000)]
-        self.assertEqual(ev_status(bs, ever_closed=True,
-                                   head="CLOSED", reason="WINDOW_JOINED"), "CLOSED")
+        self.assertEqual(ev_status(bs, ever_closed=True, reason="WINDOW_JOINED"), "REOPENED")
 
     def test_missing_window_keeps_order_open(self):
         self.assertEqual(ev_status([binding()], missing=[60_000]), "OPEN")
@@ -82,11 +107,11 @@ class TestEvaluateOrder(unittest.TestCase):
 
     def test_gap_after_close_is_reopened_not_waiting(self):
         self.assertEqual(ev_status([binding(has_gap=True)], ever_closed=True,
-                                   head="REOPENED", reason="WINDOW_CORRECTED"), "REOPENED")
+                                   reason="WINDOW_CORRECTED"), "REOPENED")
 
     def test_missing_after_close_is_reopened_not_open(self):
         self.assertEqual(ev_status([binding()], missing=[60_000], ever_closed=True,
-                                   head="REOPENED", reason="WINDOW_CORRECTED"), "REOPENED")
+                                   reason="WINDOW_JOINED"), "REOPENED")
 
 
 class TestOrderReason(unittest.TestCase):

@@ -114,6 +114,54 @@ def decide(head, new_payload):
 
 
 # ---------------------------------------------------------------------------
+# Per-key emission gate (按业务键分开关窗).
+#
+# A result for (window, key) is emitted only when *that key's own two sides*
+# have both crossed the window end — never on a global min-watermark, so one
+# quiet business cannot stall the others, and a slow business simply keeps
+# waiting: its stored events plus the absence of a result *are* the waiting
+# state, re-evaluated every tick, never dropped. Emission is one-shot per
+# (window, key) and results are append-only, so a watermark regression can
+# never un-emit what already went out. Late events / retractions recompute
+# already-emitted windows through the usual correction path, unchanged.
+# ---------------------------------------------------------------------------
+
+# Watermark sources that count as a real progress promise. An idle-timeout
+# watermark is wall-clock guesswork about a silent stream, not a promise —
+# it must never finalize businesses still waiting for that side.
+CROSSING_SOURCES = ("event_time", "override")
+
+
+def side_evidence(mark, window_end):
+    """Why one stream counts as past ``window_end`` for one key, or None.
+
+    ``mark`` — {"watermark", "source", "key_max_event_time"} for one
+    (stream, key). Two kinds of crossing evidence, either sufficient:
+
+    - ``own_progress``: the key itself has an event on this stream at or
+      beyond the window end — the business has moved on by itself, no need
+      to wait for the rest of the stream;
+    - ``watermark``: the stream watermark covers the window end AND comes
+      from a real promise (event data or an operator override) — not from
+      idle wall-clock advancement.
+    """
+    key_max = mark.get("key_max_event_time")
+    if key_max is not None and key_max >= window_end:
+        return "own_progress"
+    watermark = mark.get("watermark")
+    if (watermark is not None and watermark >= window_end
+            and mark.get("source") in CROSSING_SOURCES):
+        return "watermark"
+    return None
+
+
+def window_ready(mark_a, mark_b, window_end):
+    """True iff both streams have crossed ``window_end`` for one key."""
+    return (side_evidence(mark_a, window_end) is not None
+            and side_evidence(mark_b, window_end) is not None)
+
+
+# ---------------------------------------------------------------------------
 # business orders (业务单): one order per business key, assembled from the
 # aligned window results. Pure state machine — the service layer supplies the
 # current bindings and the window-gaps view, this decides the order's status.
@@ -125,7 +173,7 @@ ORDER_REASONS = ("ORDER_OPENED", "WINDOW_JOINED", "WINDOW_CORRECTED",
                  "WINDOW_WITHDRAWN", "WINDOW_REVIVED")
 
 
-def evaluate_order(bindings, missing, pending, ever_closed, head_status, reason):
+def evaluate_order(bindings, missing, pending, ever_closed, reason):
     """Decide an order's status from its current window bindings.
 
     ``bindings``    — one dict per bound window: {"result_status", "has_gap"}.
@@ -133,7 +181,6 @@ def evaluate_order(bindings, missing, pending, ever_closed, head_status, reason)
                       has passed) whose results are not in the order yet.
     ``pending``     — business windows known from events but not yet due.
     ``ever_closed`` — the order has reached CLOSED at least once before.
-    ``head_status`` — the order's current head status.
     ``reason``      — what the triggering result version did to its window.
 
     CLOSE requires all of: at least one live window; every known business
@@ -141,18 +188,20 @@ def evaluate_order(bindings, missing, pending, ever_closed, head_status, reason)
     unresolved; no live window still waiting for the opposite side. All
     windows withdrawn -> VOID (the business is gone, not a success).
 
-    A correction or withdrawal landing on a CLOSED order always reopens it —
-    the order must never sail through a post-close change still showing
-    CLOSED, even if everything still matches. It re-closes when a *later*
-    trigger finds the close conditions met again. Anything else short of
-    CLOSE is OPEN while windows are still being collected and WAITING once
-    only one-sided gaps remain — labelled REOPENED instead once the order
-    has been closed before.
+    A correction or withdrawal NEVER (re)closes an order that has been closed
+    before: the close is invalidated and stays invalidated — the order shows
+    REOPENED, never "still closed", no matter how well the data matches after
+    the correction. Only genuine new business can close it again: a new
+    window joining (WINDOW_JOINED) or a withdrawn window reviving
+    (WINDOW_REVIVED), evaluated against the close conditions. Anything else
+    short of CLOSE is OPEN while windows are still being collected and
+    WAITING once only one-sided gaps remain — labelled REOPENED instead once
+    the order has been closed before.
     """
     live = [b for b in bindings if b["result_status"] == "CURRENT"]
     if not live:
         return "VOID"
-    if head_status == "CLOSED" and reason in ("WINDOW_CORRECTED", "WINDOW_WITHDRAWN"):
+    if ever_closed and reason in ("WINDOW_CORRECTED", "WINDOW_WITHDRAWN"):
         return "REOPENED"
     if missing or pending or any(b["result_status"] == "RETRACTED" for b in bindings):
         return "REOPENED" if ever_closed else "OPEN"
