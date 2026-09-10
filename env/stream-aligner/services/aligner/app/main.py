@@ -31,6 +31,14 @@ exist without its deliveries. A dispatcher pushes deliveries to each
 subscriber in per-result version order (a later version is never sent before
 an earlier one), retries failures with exponential backoff, and never gives up
 — nothing is silently dropped.
+
+Historical replays are separate BACKFILL-channel deliveries: a per-subscriber
+job copies only versions that already crossed the release gate, preserving
+each version's original kind, payload, timestamp and order. The live REALTIME
+channel always has priority, so history cannot cut in front of a downstream's
+in-flight live order; a replay job can be paused and later resumed, and the
+outbox identity prevents the same subscriber/version from being replayed
+twice.
 """
 import json
 import logging
@@ -49,8 +57,8 @@ from pydantic import BaseModel, Field
 
 from app.core import (ORDER_STATUSES, build_order_snapshot, compute_payload,
                       decide, delivery_kind, evaluate_order, order_reason,
-                      retry_delay_ms, should_deliver, side_evidence,
-                      window_of, window_ready)
+                      released_version_kind, retry_delay_ms, should_deliver,
+                      side_evidence, window_of, window_ready)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -160,6 +168,54 @@ CREATE TABLE IF NOT EXISTS deliveries (
 );
 CREATE INDEX IF NOT EXISTS deliveries_due_idx
     ON deliveries (next_attempt_at) WHERE status <> 'DELIVERED';
+
+-- Historical replay (历史补推). REALTIME rows are the normal release outbox;
+-- BACKFILL rows are versions copied from the immutable release history into a
+-- per-subscriber replay job. They share the same delivery identity
+-- (subscriber, window, key, version), so a version can never be enqueued twice.
+ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS channel TEXT NOT NULL DEFAULT 'REALTIME';
+ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS backfill_job_id BIGINT;
+DO $$
+BEGIN
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_channel_check
+        CHECK (channel IN ('REALTIME', 'BACKFILL'));
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END $$;
+CREATE INDEX IF NOT EXISTS deliveries_subscriber_channel_idx
+    ON deliveries (subscriber_id, channel, status)
+    INCLUDE (window_start, key, version);
+CREATE INDEX IF NOT EXISTS deliveries_backfill_job_idx
+    ON deliveries (backfill_job_id, id)
+    WHERE backfill_job_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS backfill_jobs (
+    id                 BIGSERIAL PRIMARY KEY,
+    subscriber_id      BIGINT NOT NULL REFERENCES subscribers(id),
+    window_start_from  BIGINT NOT NULL,
+    window_start_to    BIGINT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'RUNNING'
+                       CHECK (status IN ('RUNNING', 'PAUSED', 'COMPLETED')),
+    total_versions     INT NOT NULL DEFAULT 0,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    paused_at          TIMESTAMPTZ,
+    completed_at       TIMESTAMPTZ,
+    CHECK (window_start_from <= window_start_to)
+);
+CREATE INDEX IF NOT EXISTS backfill_jobs_subscriber_idx
+    ON backfill_jobs (subscriber_id, id DESC);
+-- Only one runnable/paused replay may exist for a subscriber. A completed job
+-- is immutable; resume creates no duplicate rows because delivery identity is
+-- globally unique per subscriber and version.
+CREATE UNIQUE INDEX IF NOT EXISTS backfill_jobs_one_active_uq
+    ON backfill_jobs (subscriber_id) WHERE status IN ('RUNNING', 'PAUSED');
+DO $$
+BEGIN
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_backfill_job_fk
+        FOREIGN KEY (backfill_job_id) REFERENCES backfill_jobs(id);
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END $$;
 -- Business orders (业务单): one order per business key, assembled from the
 -- aligned window results above. The order row is only a denormalized head;
 -- every state change is an append-only row in biz_order_versions carrying a
@@ -952,28 +1008,242 @@ def set_gate(conn, key, open_):
 
 
 # ---------------------------------------------------------------------------
+# historical backfill (历史补推)
+# ---------------------------------------------------------------------------
+# Replay is a point-in-time copy of versions that have already crossed the
+# global release gate — never internal/held versions. For every released
+# window, replay starts at the version recorded in window_releases (the first
+# version the outside world was allowed to see) and follows later versions in
+# result-id/version order. Versions before that first release are deliberately
+# invisible here.
+#
+# Copies are ordinary deliveries with channel='BACKFILL'. The delivery primary
+# identity (subscriber, window, key, version) stays unique, so the same
+# downstream can never replay a version it already has, whether the existing
+# row is realtime or a previous backfill. The live dispatcher has priority:
+# backfill rows are due only when the subscriber has no unfinished REALTIME
+# delivery. Consequently a historical replay cannot cut in front of a live
+# order, while corrections created during replay remain REALTIME and bypass
+# the backfill queue. A replay job can be paused; its delivery rows and retry
+# timers stay exactly where they were, so resume continues at the same place.
+
+BACKFILL_CANDIDATE_SQL = """
+WITH first_release AS (
+    SELECT window_start, key, MIN(result_version) AS first_version
+    FROM window_releases
+    WHERE window_start >= %s AND window_start < %s
+    GROUP BY window_start, key
+)
+SELECT r.id, r.window_start, r.window_end, r.key, r.version, r.reason,
+       r.payload, r.created_at, f.first_version
+FROM results r
+JOIN first_release f
+  ON f.window_start = r.window_start AND f.key = r.key
+WHERE r.version >= f.first_version
+ORDER BY r.id
+"""
+
+
+def create_backfill(conn, subscriber_id, window_start_from, window_start_to):
+    """Create and materialize one subscriber's historical replay job.
+
+    Candidate selection and delivery copies are one repeatable-read
+    transaction, making the replay a snapshot of externally released versions
+    at creation time. A later release/correction stays realtime and is not
+    silently added to this job. Existing delivery rows are never overwritten:
+    that is the database-level guarantee that one downstream never gets the
+    same version through two backfills.
+    """
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        cur.execute(
+            """SELECT id, name, url, active FROM subscribers
+               WHERE id = %s FOR UPDATE""",
+            (subscriber_id,),
+        )
+        subscriber = cur.fetchone()
+        if subscriber is None:
+            raise HTTPException(404, "no such subscriber")
+        if not subscriber["active"]:
+            raise HTTPException(409, "subscriber is deactivated; re-register it before backfill")
+        cur.execute(
+            """SELECT id, status FROM backfill_jobs
+               WHERE subscriber_id = %s AND status IN ('RUNNING', 'PAUSED')""",
+            (subscriber_id,),
+        )
+        active = cur.fetchone()
+        if active is not None:
+            raise HTTPException(
+                409,
+                f"subscriber {subscriber['name']!r} already has backfill job "
+                f"{active['id']} in status {active['status']}; stop or wait for it first")
+
+        cur.execute(
+            """INSERT INTO backfill_jobs
+                   (subscriber_id, window_start_from, window_start_to, status)
+               VALUES (%s, %s, %s, 'RUNNING')
+               RETURNING *""",
+            (subscriber_id, window_start_from, window_start_to),
+        )
+        job = cur.fetchone()
+        cur.execute(
+            BACKFILL_CANDIDATE_SQL,
+            (window_start_from, window_start_to),
+        )
+        candidates = cur.fetchall()
+        enqueued = 0
+        for r in candidates:
+            status = "RETRACTED" if r["payload"] is None else "CURRENT"
+            kind = released_version_kind(
+                r["version"], r["first_version"], r["reason"], status)
+            cur.execute(
+                """INSERT INTO deliveries
+                       (subscriber_id, window_start, window_end, key, version,
+                        kind, payload, channel, backfill_job_id, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, 'BACKFILL', %s, %s)
+                   ON CONFLICT (subscriber_id, window_start, key, version) DO NOTHING""",
+                (subscriber_id, r["window_start"], r["window_end"], r["key"],
+                 r["version"], kind,
+                 psycopg2.extras.Json(r["payload"]) if r["payload"] is not None else None,
+                 job["id"], r["created_at"]),
+            )
+            enqueued += cur.rowcount
+        cur.execute(
+            """UPDATE backfill_jobs
+               SET total_versions = %s,
+                   status = CASE WHEN %s = 0 THEN 'COMPLETED' ELSE status END,
+                   completed_at = CASE WHEN %s = 0 THEN now() ELSE completed_at END
+               WHERE id = %s
+               RETURNING *""",
+            (enqueued, enqueued, enqueued, job["id"]),
+        )
+        return cur.fetchone()
+
+
+def get_backfill_job(cur, job_id, for_update=False):
+    cur.execute(
+        f"SELECT * FROM backfill_jobs WHERE id = %s{' FOR UPDATE' if for_update else ''}",
+        (job_id,),
+    )
+    return cur.fetchone()
+
+
+def stop_backfill(conn, job_id):
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        job = get_backfill_job(cur, job_id, for_update=True)
+        if job is None:
+            raise HTTPException(404, "no such backfill job")
+        if job["status"] == "RUNNING":
+            cur.execute(
+                """UPDATE backfill_jobs
+                   SET status = 'PAUSED', paused_at = now()
+                   WHERE id = %s RETURNING *""",
+                (job_id,),
+            )
+            job = cur.fetchone()
+    return job
+
+
+def resume_backfill(conn, job_id):
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        job = get_backfill_job(cur, job_id, for_update=True)
+        if job is None:
+            raise HTTPException(404, "no such backfill job")
+        if job["status"] == "PAUSED":
+            cur.execute(
+                """UPDATE backfill_jobs
+                   SET status = 'RUNNING', paused_at = NULL
+                   WHERE id = %s RETURNING *""",
+                (job_id,),
+            )
+            job = cur.fetchone()
+    return job
+
+
+def complete_finished_backfill_jobs(cur):
+    """Mark runnable jobs completed once every copied version is settled.
+
+    Paused jobs are deliberately left PAUSED even if an in-flight request
+    completed their final row: resuming a finished job is a harmless no-op and
+    the explicit stop state remains auditable.
+    """
+    cur.execute(
+        """UPDATE backfill_jobs j
+           SET status = 'COMPLETED', completed_at = now()
+           WHERE j.status = 'RUNNING'
+             AND NOT EXISTS (
+                 SELECT 1 FROM deliveries d
+                 WHERE d.backfill_job_id = j.id
+                   AND d.status IN ('PENDING', 'RETRYING')
+             )
+         """
+    )
+
+
+# ---------------------------------------------------------------------------
 # delivery dispatcher (transactional outbox)
 # ---------------------------------------------------------------------------
 
-# A delivery is due only when every earlier version of the *same result* for
-# the *same subscriber* is DELIVERED — version N+1 must never reach a
-# downstream before version N. Different results proceed independently.
+# A REALTIME delivery is due only when every earlier REALTIME version of the
+# same result for the same subscriber is DELIVERED — version N+1 must never
+# reach a downstream before version N. Different results proceed independently.
+# BACKFILL deliveries are selected by a separate query and have an additional
+# subscriber-level barrier so history can never jump ahead of a live backlog.
 DUE_SQL = """
 SELECT d.id, d.subscriber_id, s.name AS subscriber, s.url,
        d.window_start, d.window_end, d.key, d.version, d.kind, d.payload,
-       d.attempts, d.created_at
+       d.attempts, d.created_at, d.channel, d.backfill_job_id
 FROM deliveries d
 JOIN subscribers s ON s.id = d.subscriber_id
 WHERE s.active
+  AND d.channel = 'REALTIME'
   AND d.status IN ('PENDING', 'RETRYING')
   AND d.next_attempt_at <= now()
   AND NOT EXISTS (
       SELECT 1 FROM deliveries p
       WHERE p.subscriber_id = d.subscriber_id
+        AND p.channel = 'REALTIME'
         AND p.window_start = d.window_start
         AND p.key = d.key
         AND p.version < d.version
         AND p.status <> 'DELIVERED'
+  )
+ORDER BY d.id
+LIMIT %s
+"""
+
+BACKFILL_DUE_SQL = """
+SELECT d.id, d.subscriber_id, s.name AS subscriber, s.url,
+       d.window_start, d.window_end, d.key, d.version, d.kind, d.payload,
+       d.attempts, d.created_at, d.channel, d.backfill_job_id
+FROM deliveries d
+JOIN subscribers s ON s.id = d.subscriber_id
+JOIN backfill_jobs j ON j.id = d.backfill_job_id
+WHERE s.active
+  AND j.status = 'RUNNING'
+  AND d.channel = 'BACKFILL'
+  AND d.status IN ('PENDING', 'RETRYING')
+  AND d.next_attempt_at <= now()
+  -- Per-result version order, limited to the backfill channel. A newer live
+  -- version may overtake history (see the next barrier), but two historical
+  -- versions of the same result still never arrive out of order.
+  AND NOT EXISTS (
+      SELECT 1 FROM deliveries p
+      WHERE p.subscriber_id = d.subscriber_id
+        AND p.channel = 'BACKFILL'
+        AND p.window_start = d.window_start
+        AND p.key = d.key
+        AND p.version < d.version
+        AND p.status <> 'DELIVERED'
+  )
+  -- History cannot cut in front of any live delivery this subscriber is still
+  -- processing. A permanently failing live order intentionally keeps replay
+  -- paused; corrections stay on the REALTIME channel and are not rerouted here.
+  AND NOT EXISTS (
+      SELECT 1 FROM deliveries live
+      WHERE live.subscriber_id = d.subscriber_id
+        AND live.channel = 'REALTIME'
+        AND live.status IN ('PENDING', 'RETRYING')
   )
 ORDER BY d.id
 LIMIT %s
@@ -997,6 +1267,8 @@ def deliver_one(conn, row):
         "version": row["version"],
         "payload": row["payload"],
         "emitted_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "channel": row.get("channel", "REALTIME"),
+        "backfill_job_id": row.get("backfill_job_id"),
     }
     attempts = row["attempts"] + 1
     try:
@@ -1032,17 +1304,32 @@ def deliver_one(conn, row):
 
 
 def dispatch_due(conn):
-    """Deliver everything currently due, draining version chains in one pass."""
-    for _ in range(20):  # a success may make the next version eligible
+    """Deliver everything currently due, draining version chains in one pass.
+
+    REALTIME is dispatched first on every iteration. Backfill is considered
+    only when no live delivery is currently due, so a large history can never
+    starve or reorder a subscriber's live traffic. Within each channel, a
+    success may unlock the next version of the same result.
+    """
+    for _ in range(20):
+        progressed = False
         with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(DUE_SQL, (DISPATCH_BATCH,))
-            rows = cur.fetchall()
-        if not rows:
-            return
-        progressed = False
-        for row in rows:
+            live_rows = cur.fetchall()
+        for row in live_rows:
             if deliver_one(conn, row):
                 progressed = True
+        if live_rows:
+            continue
+
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(BACKFILL_DUE_SQL, (DISPATCH_BATCH,))
+            backfill_rows = cur.fetchall()
+        for row in backfill_rows:
+            if deliver_one(conn, row):
+                progressed = True
+        with conn, conn.cursor() as cur:
+            complete_finished_backfill_jobs(cur)
         if not progressed:
             return
 
@@ -1396,6 +1683,13 @@ class GateIn(BaseModel):
     open: bool
 
 
+class BackfillIn(BaseModel):
+    subscriber_id: Optional[int] = None
+    subscriber_name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    from_window_start: int = Field(ge=0, description="inclusive lower bound by window_start")
+    to_window_start: int = Field(ge=0, description="exclusive upper bound by window_start")
+
+
 @app.post("/releases")
 def release(body: ReleaseIn):
     """One-shot external release for ONE business key.
@@ -1536,10 +1830,10 @@ class SubscriptionIn(BaseModel):
 def subscribe(body: SubscriptionIn):
     """Register (or re-register) a downstream receiver.
 
-    Re-posting an existing name updates its URL and re-activates it. Only
-    versions emitted *after* registration are delivered — a downstream that
-    needs history should first read it via /results/* (that is how existing
-    consumers already booked their state).
+    Re-posting an existing name updates its URL and re-activates it. New
+    versions are delivered in the REALTIME channel. Already-released history
+    can be replayed explicitly with POST /backfills; held/internal versions
+    are never part of that replay.
     """
     if not body.url.startswith(("http://", "https://")):
         raise HTTPException(422, "url must be an http(s) endpoint")
@@ -1600,14 +1894,150 @@ def unsubscribe(subscriber_id: int):
     return {"subscription": row}
 
 
+def backfill_job_json(cur, job):
+    """A job row plus live counts from its copied delivery rows."""
+    cur.execute(
+        """SELECT count(*) FILTER (WHERE status = 'DELIVERED') AS delivered,
+                  count(*) FILTER (WHERE status IN ('PENDING', 'RETRYING')) AS pending,
+                  count(*) FILTER (WHERE status = 'RETRYING') AS retrying
+           FROM deliveries WHERE backfill_job_id = %s""",
+        (job["id"],),
+    )
+    counts = cur.fetchone()
+    return {
+        **job,
+        "delivered_versions": counts["delivered"],
+        "pending_versions": counts["pending"],
+        "retrying_versions": counts["retrying"],
+        "unfinished_versions": counts["pending"],
+    }
+
+
+@app.post("/backfills")
+def create_backfill_endpoint(body: BackfillIn):
+    """Replay externally released history for one registered downstream.
+
+    The window range is half-open and compared against ``window_start``:
+    ``[from_window_start, to_window_start)``. Only versions at or after each
+    window's first externally released version are copied; internal versions
+    held before release are not. The copied versions keep their original
+    payload, kind and version timestamp, and are dispatched in the BACKFILL
+    channel behind any unfinished live delivery for this subscriber.
+    """
+    if body.to_window_start <= body.from_window_start:
+        raise HTTPException(422, "to_window_start must be greater than from_window_start")
+    if (body.subscriber_id is None) == (body.subscriber_name is None):
+        raise HTTPException(422, "provide exactly one of subscriber_id or subscriber_name")
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if body.subscriber_id is not None:
+                cur.execute("SELECT id FROM subscribers WHERE id = %s",
+                            (body.subscriber_id,))
+            else:
+                cur.execute("SELECT id FROM subscribers WHERE name = %s",
+                            (body.subscriber_name,))
+            row = cur.fetchone()
+            if row is None:
+                raise HTTPException(404, "no such subscriber")
+            subscriber_id = row["id"]
+        try:
+            job = create_backfill(conn, subscriber_id,
+                                  body.from_window_start, body.to_window_start)
+        except psycopg2.errors.UniqueViolation:
+            raise HTTPException(409, "an active backfill job already exists for this subscriber")
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            payload = backfill_job_json(cur, job)
+    finally:
+        conn.close()
+    log.info("backfill job %s created for subscriber=%s range=[%s,%s): %d versions",
+             payload["id"], payload["subscriber_id"],
+             payload["window_start_from"], payload["window_start_to"],
+             payload["total_versions"])
+    return {"backfill": payload}
+
+
+@app.get("/backfills")
+def list_backfills(subscriber_id: Optional[int] = None,
+                   subscriber: Optional[str] = None,
+                   status: Optional[str] = None,
+                   limit: int = Query(default=100)):
+    if status is not None and status not in ("RUNNING", "PAUSED", "COMPLETED"):
+        raise HTTPException(422, "status must be RUNNING, PAUSED or COMPLETED")
+    sql = """SELECT j.* FROM backfill_jobs j
+             JOIN subscribers s ON s.id = j.subscriber_id"""
+    conds, args = [], []
+    if subscriber_id is not None:
+        conds.append("j.subscriber_id = %s")
+        args.append(subscriber_id)
+    if subscriber is not None:
+        conds.append("s.name = %s")
+        args.append(subscriber)
+    if status is not None:
+        conds.append("j.status = %s")
+        args.append(status)
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY j.id DESC LIMIT %s"
+    args.append(min(max(limit, 1), 1000))
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, args)
+            jobs = [backfill_job_json(cur, row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+    return {"backfills": jobs}
+
+
+@app.get("/backfills/{job_id}")
+def get_backfill(job_id: int):
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            job = get_backfill_job(cur, job_id)
+            payload = backfill_job_json(cur, job) if job else None
+    finally:
+        conn.close()
+    if payload is None:
+        raise HTTPException(404, "no such backfill job")
+    return {"backfill": payload}
+
+
+@app.post("/backfills/{job_id}/stop")
+def stop_backfill_endpoint(job_id: int):
+    conn = connect()
+    try:
+        job = stop_backfill(conn, job_id)
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            payload = backfill_job_json(cur, job)
+    finally:
+        conn.close()
+    return {"backfill": payload}
+
+
+@app.post("/backfills/{job_id}/resume")
+def resume_backfill_endpoint(job_id: int):
+    conn = connect()
+    try:
+        job = resume_backfill(conn, job_id)
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            payload = backfill_job_json(cur, job)
+    finally:
+        conn.close()
+    return {"backfill": payload}
+
+
 DELIVERY_COLS = """d.id, s.name AS subscriber, s.url, d.window_start, d.window_end, d.key,
                    d.version, d.kind, d.status, d.attempts, d.last_error,
-                   d.next_attempt_at, d.last_attempt_at, d.delivered_at, d.created_at"""
+                   d.next_attempt_at, d.last_attempt_at, d.delivered_at, d.created_at,
+                   d.channel, d.backfill_job_id"""
 
 
 @app.get("/deliveries")
 def deliveries(window_start: Optional[int] = None, key: Optional[str] = None,
                subscriber: Optional[str] = None, status: Optional[str] = None,
+               channel: Optional[str] = None, backfill_job_id: Optional[int] = None,
                limit: int = Query(default=200)):
     """Raw outbox view: every (subscriber, result version) delivery row."""
     sql = f"SELECT {DELIVERY_COLS} FROM deliveries d JOIN subscribers s ON s.id = d.subscriber_id"
@@ -1626,6 +2056,14 @@ def deliveries(window_start: Optional[int] = None, key: Optional[str] = None,
             raise HTTPException(422, "status must be PENDING, RETRYING or DELIVERED")
         conds.append("d.status = %s")
         args.append(status)
+    if channel is not None:
+        if channel not in ("REALTIME", "BACKFILL"):
+            raise HTTPException(422, "channel must be REALTIME or BACKFILL")
+        conds.append("d.channel = %s")
+        args.append(channel)
+    if backfill_job_id is not None:
+        conds.append("d.backfill_job_id = %s")
+        args.append(backfill_job_id)
     if conds:
         sql += " WHERE " + " AND ".join(conds)
     sql += " ORDER BY d.id DESC LIMIT %s"
@@ -1674,6 +2112,7 @@ def result_delivery(window_start: int, key: str):
             "version": r["version"], "kind": r["kind"], "status": r["status"],
             "attempts": r["attempts"], "last_error": r["last_error"],
             "next_attempt_at": r["next_attempt_at"], "delivered_at": r["delivered_at"],
+            "channel": r["channel"], "backfill_job_id": r["backfill_job_id"],
         })
     for sub in by_sub.values():
         for v in sub["versions"]:

@@ -83,6 +83,20 @@ def delivery_kind(reason, status):
     return "NEW" if reason == "INITIAL" else "CORRECTION"
 
 
+def released_version_kind(version, first_released_version, reason, status):
+    """Classify a version when replaying versions that crossed the release gate.
+
+    The first version that was externally released is always NEW to that
+    downstream, even if it was an internal correction (for example v3 when v1
+    and v2 were held internally). Later released versions keep their original
+    external classification. Versions below ``first_released_version`` are
+    internal-only and must not be replayed by the caller.
+    """
+    if version == first_released_version:
+        return "NEW"
+    return delivery_kind(reason, status)
+
+
 def retry_delay_ms(attempts, base_ms, max_ms):
     """Exponential backoff after ``attempts`` failed attempts (attempts >= 1)."""
     return min(base_ms * (2 ** (attempts - 1)), max_ms)

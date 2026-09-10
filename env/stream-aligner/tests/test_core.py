@@ -6,8 +6,9 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "services", "aligner"))
 
 from app.core import (compute_payload, decide, delivery_kind, effective,  # noqa: E402
-                      payload_hash, releasable, retry_delay_ms, should_deliver,
-                      side_evidence, window_of, window_ready)
+                      payload_hash, released_version_kind, releasable,
+                      retry_delay_ms, should_deliver, side_evidence, window_of,
+                      window_ready)
 
 W = 30_000
 
@@ -125,6 +126,26 @@ class TestDeliveryKind(unittest.TestCase):
     def test_revival_after_withdrawal_is_correction_not_new(self):
         # a result coming back after being withdrawn must amend, not double-book
         self.assertEqual(delivery_kind("LATE_EVENT", "CURRENT"), "CORRECTION")
+
+
+class TestReleasedVersionKind(unittest.TestCase):
+    def test_first_released_version_is_always_new(self):
+        self.assertEqual(released_version_kind(3, 3, "LATE_EVENT", "CURRENT"), "NEW")
+        self.assertEqual(released_version_kind(5, 5, "RETRACTION", "CURRENT"), "NEW")
+
+    def test_replay_caller_excludes_versions_before_first_release(self):
+        # released_version_kind only receives versions >= first_release; v1/v2
+        # are filtered by the replay candidate query because they never crossed.
+        first_release = 3
+        replayed_versions = [v for v in (1, 2, 3, 4) if v >= first_release]
+        self.assertEqual(replayed_versions, [3, 4])
+        self.assertEqual([released_version_kind(v, first_release,
+                                                 "LATE_EVENT", "CURRENT")
+                          for v in replayed_versions], ["NEW", "CORRECTION"])
+
+    def test_later_released_versions_keep_original_kind(self):
+        self.assertEqual(released_version_kind(4, 3, "LATE_EVENT", "CURRENT"), "CORRECTION")
+        self.assertEqual(released_version_kind(5, 3, "RETRACTION", "RETRACTED"), "WITHDRAWAL")
 
 
 class TestSideEvidence(unittest.TestCase):
