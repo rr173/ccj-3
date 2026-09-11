@@ -224,6 +224,10 @@ def main():
           row and row["status"] == "ALIGNED" and row["gated"] is False, str(row))
 
     # -- a downstream claiming a version we are still retrying -----------------
+    wait_for("post-dead v1 dispatched and being retried",
+             lambda: any(d["version"] == 1 for d in get(
+                 R, "/deliveries", subscriber=DEAD, key=k1,
+                 status="RETRYING")["deliveries"]))
     p = report(DEAD, ws, k1, 1)
     check("reporting a version still being retried -> AHEAD_UNCONFIRMED",
           p.get("posting", {}).get("status") == "AHEAD_UNCONFIRMED", str(p))
@@ -260,6 +264,13 @@ def main():
     pend = get(R, "/deliveries", key=k1, status="PENDING")["deliveries"]
     check("v3 sits PENDING in the outbox, held by the ledger gate",
           any(d["version"] == 3 and d["subscriber"] == GOOD for d in pend), str(pend))
+    bad = report(GOOD, ws, k1, 3)
+    check("reporting the still-held v3 is rejected (409): never delivered",
+          bad.get("_status") == 409, str(bad))
+    row = posting(GOOD, ws, k1)
+    check("the rejected report changed nothing (still reported 1, delivered 2)",
+          row and row["reported_version"] == 1 and row["delivered_up_to"] == 2
+          and row["status"] == "LAGGING", str(row))
 
     # -- other results of the same downstream are NOT held ----------------------
     upsert(B, f"{k2}-b-late", ws + 500, k2, {"n": 2})   # k2 v2
@@ -378,9 +389,12 @@ def main():
           any(e["event"] == "REPORT_ACCEPTED" and e["cause_version"] == 1
               and e["prev_reported"] == 3 and e["reported_version"] == 1
               and e["status"] == "LAGGING" for e in events), str(kinds))
-    check("the rejected report is traced",
+    check("the rejected reports are traced (never-sent v99, still-held v3)",
           any(e["event"] == "REPORT_REJECTED" and e["cause_version"] == 99
-              for e in events), str(kinds))
+              for e in events)
+          and any(e["event"] == "REPORT_REJECTED" and e["cause_version"] == 3
+                  and (e["detail"] or {}).get("reason") == "version_not_yet_delivered"
+                  for e in events), str(kinds))
 
     post(A, "/watermark/override", {"watermark": None})
     post(B, "/watermark/override", {"watermark": None})

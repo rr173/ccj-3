@@ -8,7 +8,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "services", "al
 from app.core import (compute_payload, decide, delivery_kind, effective,  # noqa: E402
                       normalize_backfill_range, payload_hash,
                       posting_gate_allows, posting_status,
-                      released_version_kind, releasable, retry_delay_ms,
+                      released_version_kind, releasable,
+                      reportable_delivery_status, retry_delay_ms,
                       should_deliver, side_evidence, window_of, window_ready)
 
 W = 30_000
@@ -325,6 +326,21 @@ class TestPostingStatus(unittest.TestCase):
         self.assertFalse(posting_gate_allows("LAGGING"))
         self.assertTrue(posting_gate_allows("ALIGNED"))
         self.assertTrue(posting_gate_allows("AHEAD_UNCONFIRMED"))
+
+
+class TestReportableDeliveryStatus(unittest.TestCase):
+    """A posting report only counts for versions that actually went out."""
+
+    def test_delivered_version_is_reportable(self):
+        self.assertTrue(reportable_delivery_status("DELIVERED"))
+
+    def test_retrying_version_is_reportable(self):
+        # dispatched, response lost — it may genuinely have posted it
+        self.assertTrue(reportable_delivery_status("RETRYING"))
+
+    def test_pending_version_is_not_reportable(self):
+        # never dispatched (e.g. still held by the gate): cannot have been posted
+        self.assertFalse(reportable_delivery_status("PENDING"))
 
 
 class TestNormalizeBackfillRange(unittest.TestCase):

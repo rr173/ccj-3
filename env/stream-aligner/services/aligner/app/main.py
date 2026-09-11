@@ -52,11 +52,13 @@ posted. Per (downstream, result) the ledger tracks reported_version against
 delivered_up_to — ALIGNED, LAGGING, or AHEAD_UNCONFIRMED (it posted a version
 we are still retrying). A new delivery on an aligned pair turns it LAGGING
 and holds that result's later versions for that downstream until its posting
-catches up; other results keep flowing. Reports naming a version never sent
-to that downstream are rejected (and traced); rollback reports move the
-ledger back without erasing delivery records. Every report and every
-delivery advance appends an immutable event, so the moment and the version
-that flipped a pair from aligned to lagging is always queryable.
+catches up; other results keep flowing. Reports only count for versions that
+actually went out (DELIVERED, or RETRYING with the response lost); a version
+never dispatched — never sent, or still held by the gate — is rejected (and
+traced); rollback reports move the ledger back without erasing delivery
+records. Every report and every delivery advance appends an immutable event,
+so the moment and the version that flipped a pair from aligned to lagging is
+always queryable.
 """
 import json
 import logging
@@ -76,8 +78,9 @@ from pydantic import BaseModel, Field
 from app.core import (ORDER_STATUSES, POSTING_STATUSES, build_order_snapshot,
                       compute_payload, decide, delivery_kind, evaluate_order,
                       normalize_backfill_range, order_reason, posting_status,
-                      released_version_kind, retry_delay_ms, should_deliver,
-                      side_evidence, window_of, window_ready)
+                      released_version_kind, reportable_delivery_status,
+                      retry_delay_ms, should_deliver, side_evidence, window_of,
+                      window_ready)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -1279,9 +1282,11 @@ def complete_finished_backfill_jobs(cur):
 #   version knocked it lagging;
 # - a downstream report (POST /postings) moves reported_version — up as it
 #   catches up, DOWN when it says it rolled back (the ledger regresses with
-#   it; delivery rows are never touched). A report naming a version that was
-#   never delivered to this downstream is rejected: it changes nothing, but
-#   the rejection itself is traced as REPORT_REJECTED.
+#   it; delivery rows are never touched). A report only counts for a version
+#   that actually went out to this downstream (DELIVERED, or RETRYING with
+#   the response lost); a version never dispatched — never sent, or still
+#   PENDING (held by the gate) — is rejected: it changes nothing, but the
+#   rejection itself is traced as REPORT_REJECTED.
 #
 # While a pair is LAGGING the dispatcher holds that result's later versions
 # for that downstream (see the NOT EXISTS gate in DUE_SQL /
@@ -1343,13 +1348,15 @@ def advance_posting_ledger(cur, delivery):
 def report_posting(conn, subscriber_id, window_start, key, version):
     """Apply one downstream posting report; returns the resulting ledger row.
 
-    The reported version must be one we actually put in this downstream's
-    outbox — a version we never sent it cannot have been posted by it, so
-    the report is rejected (the caller answers 409) and the rejection is
-    traced. Reports may move the posted position backwards (the downstream
-    rolled its books back): the ledger regresses accordingly while every
-    delivery row stays put. Both the ledger write and its event commit in
-    one transaction.
+    The reported version must be one we actually DELIVERED or at least put on
+    the wire (RETRYING — the response was lost, so it may genuinely have
+    booked it). A version never dispatched to this downstream — never sent at
+    all, or still PENDING (e.g. held by the ledger gate) — cannot have been
+    posted by it: the report is rejected (the caller answers 409) and the
+    rejection is traced. Reports may move the posted position backwards (the
+    downstream rolled its books back): the ledger regresses accordingly while
+    every delivery row stays put. Both the ledger write and its event commit
+    in one transaction.
     """
     with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         # Serialize against a concurrent delivery advancing the same
@@ -1357,12 +1364,13 @@ def report_posting(conn, subscriber_id, window_start, key, version):
         cur.execute("SELECT 1 FROM subscribers WHERE id = %s FOR UPDATE",
                     (subscriber_id,))
         cur.execute(
-            """SELECT 1 FROM deliveries
+            """SELECT status FROM deliveries
                WHERE subscriber_id = %s AND window_start = %s
                  AND key = %s AND version = %s""",
             (subscriber_id, window_start, key, version),
         )
-        ever_sent = cur.fetchone() is not None
+        sent = cur.fetchone()
+        dispatched = sent is not None and reportable_delivery_status(sent["status"])
         cur.execute(
             """SELECT reported_version, delivered_up_to, status FROM posting_ledger
                WHERE subscriber_id = %s AND window_start = %s AND key = %s
@@ -1372,13 +1380,17 @@ def report_posting(conn, subscriber_id, window_start, key, version):
         row = cur.fetchone()
         prev = ((row["reported_version"], row["delivered_up_to"], row["status"])
                 if row else None)
-        if not ever_sent:
-            # A version this downstream never got from us: the report cannot
-            # count. Trace the rejection, change nothing.
+        if not dispatched:
+            # A version this downstream never got from us (never sent, or
+            # still held undelivered): the report cannot count. Trace the
+            # rejection, change nothing.
+            detail = ({"reason": "version_never_sent_to_subscriber"}
+                      if sent is None else
+                      {"reason": "version_not_yet_delivered",
+                       "delivery_status": sent["status"]})
             record_posting_event(
                 cur, subscriber_id, window_start, key, "REPORT_REJECTED",
-                version, prev, prev or (None, None, None),
-                {"reason": "version_never_sent_to_subscriber"})
+                version, prev, prev or (None, None, None), detail)
             return None
         if row is None:
             # First report for this pair: seed delivered_up_to from the
@@ -2422,9 +2434,11 @@ class PostingIn(BaseModel):
 def posting_report(body: PostingIn):
     """A downstream reports which version of one result it has posted.
 
-    The report only counts when it names a version that was actually sent to
-    this downstream (a deliveries row exists): reporting a version we never
-    sent is rejected with 409 — it changes nothing, though the rejection
+    The report only counts when it names a version that actually went out to
+    this downstream: DELIVERED, or RETRYING (dispatched, the response was
+    lost — it may genuinely have posted it). Reporting a version that never
+    reached it — never sent at all, or still PENDING (held by the ledger
+    gate) — is rejected with 409: it changes nothing, though the rejection
     itself is traced in the ledger history. A report below the current posted
     position is a rollback: the ledger regresses with it (already-delivered
     records are never erased), and the pair turns LAGGING until its posting
@@ -2453,8 +2467,9 @@ def posting_report(body: PostingIn):
     if posting is None:
         raise HTTPException(
             409,
-            f"version {body.version} of ({body.window_start}, {body.key!r}) was "
-            "never sent to this subscriber; the report does not count")
+            f"version {body.version} of ({body.window_start}, {body.key!r}) "
+            "has not been delivered to this subscriber (never sent, or still "
+            "held undelivered); the report does not count")
     return {"posting": posting}
 
 

@@ -198,6 +198,10 @@ sleep 3
 echo "v6 computed but HELD while the pair lags — still PENDING in the outbox:"
 curl -sf "$R/deliveries?window_start=$WS&key=order-1&status=PENDING" \
   | field "[(d['version'], d['kind'], d['status']) for d in d['deliveries']]"
+echo "reporting the still-held v6 is rejected too (never delivered, does not count):"
+curl -s -o /dev/null -w '  http status: %{http_code}\n' -X POST "$R/postings" \
+  -H 'Content-Type: application/json' \
+  -d "{\"subscriber_name\":\"demo-sink\",\"window_start\":$WS,\"key\":\"order-1\",\"version\":6}"
 echo "reporting a version we never sent (v99) is rejected and does not count:"
 curl -s -o /dev/null -w '  http status: %{http_code}\n' -X POST "$R/postings" \
   -H 'Content-Type: application/json' \

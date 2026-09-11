@@ -246,6 +246,21 @@ def posting_gate_allows(status):
     return status != "LAGGING"
 
 
+def reportable_delivery_status(delivery_status):
+    """Whether a downstream's posting report for one version may count, given
+    that version's delivery status for that downstream.
+
+    Only versions we actually put on the wire can be reported as posted:
+    ``DELIVERED`` (confirmed) or ``RETRYING`` (dispatched at least once, the
+    response was lost — the downstream may genuinely have booked it, which is
+    exactly the AHEAD_UNCONFIRMED case). A version never dispatched —
+    ``PENDING``, e.g. still held by the ledger gate — has not been sent to
+    it, so its "I already posted it" report cannot count: the report is
+    rejected and the ledger stays put.
+    """
+    return delivery_status in ("DELIVERED", "RETRYING")
+
+
 # ---------------------------------------------------------------------------
 # Per-key emission gate (按业务键分开关窗).
 #
