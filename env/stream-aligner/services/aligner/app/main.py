@@ -97,8 +97,10 @@ from app.core import (ORDER_STATUSES, POSTING_STATUSES, build_order_snapshot,
                       normalize_backfill_range, order_reason, posting_status,
                       ranges_overlap, reconciliation_can_close,
                       reconciliation_item_status, released_version_kind,
-                      reportable_delivery_status, retry_delay_ms, should_deliver,
-                      side_evidence, window_of, window_ready)
+                      reportable_delivery_status, retry_delay_ms,
+                      settlement_blocks_report, settlement_effect,
+                      settlement_fulfils, settlement_pin_version,
+                      should_deliver, side_evidence, window_of, window_ready)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -404,7 +406,8 @@ CREATE TABLE IF NOT EXISTS posting_events (
     window_start     BIGINT NOT NULL,
     key              TEXT NOT NULL,
     event            TEXT NOT NULL CHECK (event IN
-                     ('REPORT_ACCEPTED', 'REPORT_REJECTED', 'DELIVERY_ADVANCED')),
+                     ('REPORT_ACCEPTED', 'REPORT_REJECTED', 'DELIVERY_ADVANCED',
+                      'SETTLEMENT_ADVANCED')),
     cause_version    INT NOT NULL,             -- the version reported / delivered
     prev_reported    INT,
     prev_delivered   INT,
@@ -502,6 +505,61 @@ CREATE TABLE IF NOT EXISTS reconciliation_events (
 );
 CREATE INDEX IF NOT EXISTS reconciliation_events_batch_idx
     ON reconciliation_events (batch_id, id);
+-- ---------------------------------------------------------------------------
+-- Settlements (对账落账), the closed-batch verdicts applied to delivery.
+--
+-- One row per (subscriber, window, key), inserted ONCE, when the first batch
+-- adjudicating that pair closes ("同一条只能落到一次"): the verdict's effect,
+-- the version the pair is pinned at, and the batch that settled it. A later
+-- batch cannot re-settle the same pair — its close fails 409 until the
+-- disputing items are resolved differently; FULFILLED rows stay (the history
+-- of where the pin was), they never block a new settlement, and the effect
+-- on delivery/reports is decided by effect+status together.
+--
+-- effect:
+--   FREEZE         (LAGGING + 认): stop at the pinned reported version —
+--                  later versions are never sent to this downstream, reports
+--                  above the pin are rejected;
+--   CONTINUE       (LAGGING + 驳): keep sending what we sent — the posting
+--                  gate never holds this pair again; discharged (FULFILLED)
+--                  once its reports move past the pinned version;
+--   SUPPRESS       (NOT_REPORTED + 认): pin 0 — the version is never
+--                  (re)delivered (re-drive or backfill), every report is
+--                  rejected;
+--   REDRIVE        (NOT_REPORTED + 驳): the pinned lowest sent version is
+--                  re-driven until reported; discharging the report settles
+--                  it (FULFILLED) and normal flow resumes;
+--   MARK_DELIVERED (AHEAD_UNCONFIRMED + 认): the in-flight versions up to the
+--                  reported pin are confirmed DELIVERED at close, the ledger
+--                  is aligned — born FULFILLED;
+--   NONE           (AHEAD_UNCONFIRMED + 驳): ordinary retries continue —
+--                  born FULFILLED, the row is the record that it was judged.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS reconciliation_settlements (
+    id                 BIGSERIAL PRIMARY KEY,
+    batch_id           BIGINT NOT NULL REFERENCES reconciliation_batches(id),
+    subscriber_id      BIGINT NOT NULL REFERENCES subscribers(id),
+    window_start       BIGINT NOT NULL,
+    key                TEXT NOT NULL,
+    effect             TEXT NOT NULL CHECK (effect IN
+                       ('FREEZE', 'CONTINUE', 'SUPPRESS', 'REDRIVE',
+                        'MARK_DELIVERED', 'NONE')),
+    status             TEXT NOT NULL DEFAULT 'ACTIVE'
+                       CHECK (status IN ('ACTIVE', 'FULFILLED')),
+    pinned_version     INT NOT NULL,
+    -- frozen snapshot references carried for the record
+    snapshot_item_status TEXT NOT NULL,
+    snapshot_decision    TEXT NOT NULL,
+    settled_by         TEXT,
+    settled_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    fulfilled_at       TIMESTAMPTZ,
+    UNIQUE (subscriber_id, window_start, key)
+);
+CREATE INDEX IF NOT EXISTS reconciliation_settlements_batch_idx
+    ON reconciliation_settlements (batch_id, id);
+CREATE INDEX IF NOT EXISTS reconciliation_settlements_active_idx
+    ON reconciliation_settlements (subscriber_id, window_start, key)
+    WHERE status = 'ACTIVE';
 """
 
 
@@ -1223,6 +1281,18 @@ FROM results r
 JOIN first_release f
   ON f.window_start = r.window_start AND f.key = r.key
 WHERE r.version >= f.first_version
+  -- A settlement pins one pair for this subscriber: versions above an
+  -- ACTIVE FREEZE/SUPPRESS pin are never copied by a later replay job
+  -- ("这一版别再补") — SUPPRESS pins at 0, so the whole result is skipped.
+  AND NOT EXISTS (
+      SELECT 1 FROM reconciliation_settlements rs
+      WHERE rs.subscriber_id = %s
+        AND rs.window_start = r.window_start
+        AND rs.key = r.key
+        AND rs.status = 'ACTIVE'
+        AND rs.effect IN ('FREEZE', 'SUPPRESS')
+        AND r.version > rs.pinned_version
+  )
 ORDER BY r.id
 """
 
@@ -1280,7 +1350,7 @@ def create_backfill(conn, subscriber_id, window_start_from, window_start_to):
         job = cur.fetchone()
         cur.execute(
             BACKFILL_CANDIDATE_SQL,
-            (from_ws, to_ws),
+            (from_ws, to_ws, subscriber_id),
         )
         candidates = cur.fetchall()
         enqueued = 0
@@ -1493,6 +1563,26 @@ def report_posting(conn, subscriber_id, window_start, key, version):
                 cur, subscriber_id, window_start, key, "REPORT_REJECTED",
                 version, prev, prev or (None, None, None), detail)
             return None
+        # Settlement gates (认/驳是在结账那一刻才落到这里的，开着账的裁决
+        # 什么都不挡): an ACTIVE FREEZE pins the pair at one version forever;
+        # an ACTIVE SUPPRESS accepts no report at all; an unfulfilled REDRIVE
+        # only accepts its pin (or above). FULFILLED settlements never block.
+        cur.execute(
+            """SELECT effect, status, pinned_version FROM reconciliation_settlements
+               WHERE subscriber_id = %s AND window_start = %s AND key = %s""",
+            (subscriber_id, window_start, key),
+        )
+        st = cur.fetchone()
+        if st is not None:
+            reason = settlement_blocks_report(
+                st["effect"], st["status"], st["pinned_version"], version)
+            if reason is not None:
+                record_posting_event(
+                    cur, subscriber_id, window_start, key, "REPORT_REJECTED",
+                    version, prev, prev or (None, None, None),
+                    {"reason": reason, "settlement_effect": st["effect"],
+                     "pinned_version": st["pinned_version"]})
+                return None
         if row is None:
             # First report for this pair: seed delivered_up_to from the
             # outbox as it stands now (the subscriber lock above makes this
@@ -1524,6 +1614,20 @@ def report_posting(conn, subscriber_id, window_start, key, version):
         new = (version, delivered, status)
         record_posting_event(cur, subscriber_id, window_start, key,
                              "REPORT_ACCEPTED", version, prev, new)
+        # Discharge an ACTIVE settlement that this report settles: a REDRIVE
+        # (驳它没入过) once the re-driven pinned version is reported; a
+        # CONTINUE (驳它没跟上) once reports move past the pinned lagging
+        # version — the disputed gap is then gone. FREEZE/SUPPRESS never
+        # discharge; MARK_DELIVERED/NONE are born FULFILLED.
+        if st is not None and settlement_fulfils(
+                st["effect"], st["status"], st["pinned_version"], version):
+            cur.execute(
+                """UPDATE reconciliation_settlements
+                   SET status = 'FULFILLED', fulfilled_at = now()
+                   WHERE subscriber_id = %s AND window_start = %s AND key = %s
+                     AND status = 'ACTIVE'""",
+                (subscriber_id, window_start, key),
+            )
         return {"subscriber_id": subscriber_id, "window_start": window_start,
                 "key": key, "reported_version": version,
                 "delivered_up_to": delivered, "status": status}
@@ -1685,6 +1789,7 @@ def create_reconciliation(conn, subscriber_id, from_ms, to_ms, created_by=None):
             (batch["id"],),
         )
         snapshot = cur.fetchall()
+        batch = get_reconciliation(cur, batch["id"])
     log.info("reconciliation batch %s opened for subscriber=%s range=[%s,%s): %d items "
              "(aligned=%d lagging=%d ahead=%d not_reported=%d)",
              batch["id"], subscriber["name"], from_ws, to_ws, len(items),
@@ -1697,7 +1802,9 @@ def get_reconciliation(cur, batch_id, for_update=False):
     cur.execute(
         f"""SELECT b.*, s.name AS subscriber, s.url,
                    b.total_items - b.aligned_items
-                       - b.confirmed_items - b.rejected_items AS unresolved_items
+                       - b.confirmed_items - b.rejected_items AS unresolved_items,
+                   (SELECT count(*) FROM reconciliation_settlements st
+                     WHERE st.batch_id = b.id) AS settled_items
             FROM reconciliation_batches b
             JOIN subscribers s ON s.id = b.subscriber_id
             WHERE b.id = %s{' FOR UPDATE' if for_update else ''}""",
@@ -1775,15 +1882,36 @@ def set_reconciliation_decision(conn, batch_id, window_start, key, decision,
 
 
 def close_reconciliation(conn, batch_id, operator=None):
-    """Close a batch once every non-aligned item carries a verdict.
+    """Close a batch once every non-aligned item carries a verdict, and
+    *settle* each adjudicated item (对账落账) in the very same transaction.
 
     Fails 409 while any LAGGING / AHEAD_UNCONFIRMED / NOT_REPORTED item is
-    still undecided — one undecided row keeps the whole batch open. Closing an
-    already-closed batch is an idempotent no-op (its frozen verdicts are
-    returned unchanged, no extra event is written).
+    still undecided — one undecided row keeps the whole batch open. A verdict
+    changes nothing while the batch is OPEN; only at close does it land as one
+    immutable reconciliation_settlements row per (subscriber, window, key) and
+    start driving delivery and posting reports for that pair ("结完才动"):
+
+    - LAGGING + CONFIRMED     -> FREEZE at the reported version (hold the rest);
+    - LAGGING + REJECTED      -> CONTINUE (the lagging gate never holds it again);
+    - NOT_REPORTED + CONFIRMED -> SUPPRESS at 0 (never redeliver, never accept
+                                 a report; in-flight versions are pulled back);
+    - NOT_REPORTED + REJECTED -> REDRIVE the lowest sent version until reported;
+    - AHEAD_UNCONFIRMED + CONFIRMED -> in-flight versions up to the reported
+                                 version are marked DELIVERED and the ledger is
+                                 aligned (MARK_DELIVERED);
+    - AHEAD_UNCONFIRMED + REJECTED  -> NONE (ordinary retries continue).
+
+    The same pair can only be settled once ("同一条只能落到一次"): closing a
+    batch whose verdict would re-settle an already-settled pair fails 409 and
+    names the blocking batch — FULFILLED rows included, they stay as history.
+    Closing an already-closed batch is an idempotent no-op.
     """
     with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT * FROM reconciliation_batches WHERE id = %s FOR UPDATE",
+        # Serialize against concurrent deliveries/reports (which lock the
+        # subscriber row) and against another close on the same batch.
+        cur.execute("SELECT b.*, s.name AS subscriber_name FROM reconciliation_batches b "
+                    "JOIN subscribers s ON s.id = b.subscriber_id "
+                    "WHERE b.id = %s FOR UPDATE OF b",
                     (batch_id,))
         batch = cur.fetchone()
         if batch is None:
@@ -1791,9 +1919,14 @@ def close_reconciliation(conn, batch_id, operator=None):
         if batch["status"] == "CLOSED":
             return get_reconciliation(cur, batch_id)
         cur.execute(
-            """SELECT window_start, key, item_status, decision
-               FROM reconciliation_items WHERE batch_id = %s FOR UPDATE""",
-            (batch_id,),
+            """SELECT i.*,
+                      (SELECT min(d.version) FROM deliveries d
+                        WHERE d.subscriber_id = %s
+                          AND d.window_start = i.window_start AND d.key = i.key)
+                          AS lowest_sent_version
+               FROM reconciliation_items i
+               WHERE i.batch_id = %s FOR UPDATE""",
+            (batch["subscriber_id"], batch_id),
         )
         items = cur.fetchall()
         unresolved = [
@@ -1808,6 +1941,56 @@ def close_reconciliation(conn, batch_id, operator=None):
                 f"non-aligned item(s): every LAGGING / AHEAD_UNCONFIRMED / NOT_REPORTED "
                 "row must be CONFIRMED or REJECTED before closing "
                 "(有一条没处理完这批不能结)")
+
+        # 同一条只能落到一次: every adjudicated pair must have no prior
+        # settlement — by ANY batch, including FULFILLED ones.
+        decided = [(r["window_start"], r["key"]) for r in items
+                   if r["decision"] is not None]
+        conflicts = []
+        if decided:
+            cur.execute(
+                """SELECT st.window_start, st.key, st.batch_id, b.status AS batch_status
+                   FROM reconciliation_settlements st
+                   JOIN reconciliation_batches b ON b.id = st.batch_id
+                   WHERE st.subscriber_id = %s
+                     AND (st.window_start, st.key) IN %s
+                   ORDER BY st.batch_id""",
+                (batch["subscriber_id"], tuple(decided)),
+            )
+            conflicts = cur.fetchall()
+        if conflicts:
+            detail = "; ".join(
+                f"({r['window_start']}, {r['key']!r}) already settled by batch "
+                f"{r['batch_id']} ({r['batch_status']})" for r in conflicts)
+            raise HTTPException(
+                409,
+                f"reconciliation batch {batch_id} cannot settle: the same pair can only be "
+                f"settled once (同一条只能落到一次) — {detail}")
+
+        settled = []
+        for it in items:
+            if it["decision"] is None:
+                continue  # ALIGNED rows carry no verdict and are not settled
+            effect = settlement_effect(it["item_status"], it["decision"])
+            pin = settlement_pin_version(
+                effect, it["reported_version"], it["lowest_sent_version"])
+            born_fulfilled = effect in ("MARK_DELIVERED", "NONE")
+            cur.execute(
+                """INSERT INTO reconciliation_settlements
+                       (batch_id, subscriber_id, window_start, key, effect, status,
+                        pinned_version, snapshot_item_status, snapshot_decision,
+                        settled_by, fulfilled_at)
+                   VALUES (%s, %s, %s, %s, %s,
+                           %s, %s, %s, %s, %s,
+                           CASE WHEN %s THEN now() END)""",
+                (batch_id, batch["subscriber_id"], it["window_start"], it["key"],
+                 effect, "FULFILLED" if born_fulfilled else "ACTIVE", pin,
+                 it["item_status"], it["decision"], operator, born_fulfilled),
+            )
+            apply_settlement_effect(cur, batch, it, effect, pin, operator)
+            settled.append({"window_start": it["window_start"], "key": it["key"],
+                            "effect": effect, "pinned_version": pin})
+
         cur.execute(
             """UPDATE reconciliation_batches
                SET status = 'CLOSED', closed_at = now(), closed_by = %s
@@ -1820,12 +2003,116 @@ def close_reconciliation(conn, batch_id, operator=None):
             (batch_id, operator,
              psycopg2.extras.Json({"total_items": batch["total_items"],
                                    "confirmed_items": batch["confirmed_items"],
-                                   "rejected_items": batch["rejected_items"]})),
+                                   "rejected_items": batch["rejected_items"],
+                                   "settled_items": len(settled),
+                                   "settlements": settled})),
         )
         closed = get_reconciliation(cur, batch_id)
-    log.info("reconciliation batch %s closed by %s (%d items)",
-             batch_id, operator, batch["total_items"])
+    log.info("reconciliation batch %s closed by %s (%d items, %d settled: %s)",
+             batch_id, operator, batch["total_items"], len(settled),
+             {e: sum(1 for s in settled if s["effect"] == e)
+              for e in ("FREEZE", "CONTINUE", "SUPPRESS", "REDRIVE",
+                        "MARK_DELIVERED", "NONE")})
     return closed
+
+
+def apply_settlement_effect(cur, batch, item, effect, pin, operator):
+    """Execute one verdict's delivery/ledger effect inside the close txn.
+
+    Runs after its immutable settlement row was inserted. All reads/writes
+    target exactly one (subscriber, window, key) pair — no other result or
+    subscriber is touched.
+    """
+    sub_id = batch["subscriber_id"]
+    ws, key = item["window_start"], item["key"]
+
+    if effect in ("FREEZE", "SUPPRESS"):
+        # Stop sending the versions above the pin: pull back every still-
+        # undelivered outbox row (REALTIME or BACKFILL). PENDING rows were
+        # never on the wire; RETRYING rows may have reached the downstream,
+        # but at-least-once + downstream version dedup makes the pullback safe.
+        # Already DELIVERED rows are the sent fact and are never touched.
+        cur.execute(
+            """UPDATE deliveries
+               SET status = 'PENDING', last_attempt_at = NULL,
+                   delivered_at = NULL, next_attempt_at = now(), last_error = NULL,
+                   attempts = 0
+               WHERE subscriber_id = %s AND window_start = %s AND key = %s
+                 AND version > %s AND status <> 'DELIVERED'""",
+            (sub_id, ws, key, pin),
+        )
+
+    if effect == "REDRIVE":
+        # Re-drive the lowest sent version until the downstream reports it.
+        # Reset that one outbox row to PENDING (it becomes due immediately);
+        # later versions stay gated behind it by the normal version-order
+        # barrier. If it is somehow already DELIVERED, nothing needs redoing.
+        cur.execute(
+            """UPDATE deliveries
+               SET status = 'PENDING', last_attempt_at = NULL,
+                   delivered_at = NULL, next_attempt_at = now(), last_error = NULL,
+                   attempts = 0
+               WHERE subscriber_id = %s AND window_start = %s AND key = %s
+                 AND version = %s AND status <> 'DELIVERED'""",
+            (sub_id, ws, key, pin),
+        )
+
+    if effect == "MARK_DELIVERED":
+        # It reported the pin version while our delivery of it was still
+        # unconfirmed (lost response / slow retry): accept that as delivered.
+        # Versions 1..pin are marked DELIVERED and the posting ledger is
+        # aligned to pin — delivery rows are the sent fact and stay in order.
+        cur.execute(
+            """UPDATE deliveries
+               SET status = 'DELIVERED', last_attempt_at = now(),
+                   delivered_at = now(), last_error = NULL
+               WHERE subscriber_id = %s AND window_start = %s AND key = %s
+                 AND version <= %s AND status <> 'DELIVERED'""",
+            (sub_id, ws, key, pin),
+        )
+        cur.execute(
+            """SELECT reported_version, delivered_up_to, status FROM posting_ledger
+               WHERE subscriber_id = %s AND window_start = %s AND key = %s
+               FOR UPDATE""",
+            (sub_id, ws, key),
+        )
+        row = cur.fetchone()
+        prev = ((row["reported_version"], row["delivered_up_to"], row["status"])
+                if row else None)
+        new_status = posting_status(pin, pin)  # ALIGNED
+        if row is None:
+            cur.execute(
+                """INSERT INTO posting_ledger
+                       (subscriber_id, window_start, key,
+                        reported_version, delivered_up_to, status)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (sub_id, ws, key, pin, pin, new_status),
+            )
+        else:
+            cur.execute(
+                """UPDATE posting_ledger
+                   SET reported_version = %s, delivered_up_to = %s,
+                       status = %s, updated_at = now()
+                   WHERE subscriber_id = %s AND window_start = %s AND key = %s""",
+                (pin, pin, new_status, sub_id, ws, key),
+            )
+        cur.execute(
+            """INSERT INTO posting_events
+                   (subscriber_id, window_start, key, event, cause_version,
+                    prev_reported, prev_delivered, prev_status,
+                    reported_version, delivered_up_to, status, detail)
+               VALUES (%s, %s, %s, 'SETTLEMENT_ADVANCED', %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (sub_id, ws, key, pin,
+             prev[0] if prev else None, prev[1] if prev else None,
+             prev[2] if prev else None, pin, pin, new_status,
+             psycopg2.extras.Json(
+                 {"reason": "reconciliation_mark_delivered", "batch_id": batch["id"],
+                  "operator": operator})),
+        )
+
+    # FREEZE / CONTINUE / SUPPRESS / REDRIVE / NONE: no other delivery-row
+    # rewrite — the effects are enforced by the dispatch due gates, the
+    # backfill copy predicate and the posting-report checks below.
 
 
 # Live (post-opening) state shown next to the frozen snapshot in item queries.
@@ -1833,6 +2120,12 @@ def close_reconciliation(conn, batch_id, operator=None):
 # write back to reconciliation_items, so the photograph cannot be retaken.
 RECON_ITEMS_SQL = """
 SELECT i.*, b.subscriber_id, s.name AS subscriber,
+       rs.effect AS settlement_effect,
+       rs.status AS settlement_status,
+       rs.pinned_version AS pinned_version,
+       rs.batch_id AS settlement_batch_id,
+       rs.settled_at AS settled_at,
+       rs.fulfilled_at AS settlement_fulfilled_at,
        (SELECT max(d.version) FROM deliveries d
          WHERE d.subscriber_id = b.subscriber_id
            AND d.window_start = i.window_start AND d.key = i.key) AS live_sent_version,
@@ -1849,6 +2142,9 @@ JOIN subscribers s ON s.id = b.subscriber_id
 LEFT JOIN posting_ledger pl
   ON pl.subscriber_id = b.subscriber_id
  AND pl.window_start = i.window_start AND pl.key = i.key
+LEFT JOIN reconciliation_settlements rs
+  ON rs.subscriber_id = b.subscriber_id
+ AND rs.window_start = i.window_start AND rs.key = i.key
 WHERE i.batch_id = %s
 {extra_conds}
 ORDER BY i.window_start, i.key
@@ -1914,11 +2210,38 @@ WHERE s.active
       -- what we already delivered for THIS result — hold its later versions
       -- until it reports catching up. Scoped to one (window, key): other
       -- results of the same downstream are never held back by this one.
+      -- A CLOSED batch's REJECT verdict on the lag (CONTINUE settlement)
+      -- permanently lifts this gate for that one pair: we keep sending what
+      -- we sent, it was not behind as far as delivery is concerned.
       SELECT 1 FROM posting_ledger pl
       WHERE pl.subscriber_id = d.subscriber_id
         AND pl.window_start = d.window_start
         AND pl.key = d.key
         AND pl.status = 'LAGGING'
+        AND NOT EXISTS (
+            SELECT 1 FROM reconciliation_settlements rs
+            WHERE rs.subscriber_id = pl.subscriber_id
+              AND rs.window_start = pl.window_start
+              AND rs.key = pl.key
+              AND rs.effect = 'CONTINUE'
+              AND rs.status = 'ACTIVE'
+        )
+  )
+  AND NOT EXISTS (
+      -- reconciliation settlement flow control: a CLOSED batch CONFIRMED the
+      -- pair at a pinned version (FREEZE = a lagging pair's then-reported
+      -- version, SUPPRESS = 0 for a version it never booked). Versions above
+      -- the pin are never delivered to THIS downstream afterward; the rows
+      -- were pulled back to PENDING at close and stay parked here forever.
+      -- REDRIVE needs no clause: its pinned row was reset to PENDING, so the
+      -- ordinary version-order barrier above parks later versions behind it.
+      SELECT 1 FROM reconciliation_settlements rs
+      WHERE rs.subscriber_id = d.subscriber_id
+        AND rs.window_start = d.window_start
+        AND rs.key = d.key
+        AND rs.status = 'ACTIVE'
+        AND rs.effect IN ('FREEZE', 'SUPPRESS')
+        AND d.version > rs.pinned_version
   )
 ORDER BY d.id
 LIMIT %s
@@ -1952,12 +2275,33 @@ WHERE s.active
   AND NOT EXISTS (
       -- the posting-ledger gate applies to replays exactly as to live
       -- traffic: a downstream behind on posting this result gets no further
-      -- versions of it, whichever channel they ride
+      -- versions of it, whichever channel they ride — unless a CLOSED batch
+      -- REJECTED that lag (ACTIVE CONTINUE settlement): then we keep sending.
       SELECT 1 FROM posting_ledger pl
       WHERE pl.subscriber_id = d.subscriber_id
         AND pl.window_start = d.window_start
         AND pl.key = d.key
         AND pl.status = 'LAGGING'
+        AND NOT EXISTS (
+            SELECT 1 FROM reconciliation_settlements rs
+            WHERE rs.subscriber_id = pl.subscriber_id
+              AND rs.window_start = pl.window_start
+              AND rs.key = pl.key
+              AND rs.effect = 'CONTINUE'
+              AND rs.status = 'ACTIVE'
+        )
+  )
+  AND NOT EXISTS (
+      -- settled pins hold on the backfill channel too: versions above an
+      -- ACTIVE FREEZE/SUPPRESS pin are never sent, even when a replay job
+      -- copied them (at close those backfill rows were parked in PENDING).
+      SELECT 1 FROM reconciliation_settlements rs
+      WHERE rs.subscriber_id = d.subscriber_id
+        AND rs.window_start = d.window_start
+        AND rs.key = d.key
+        AND rs.status = 'ACTIVE'
+        AND rs.effect IN ('FREEZE', 'SUPPRESS')
+        AND d.version > rs.pinned_version
   )
 ORDER BY d.id
 LIMIT %s
@@ -2946,14 +3290,36 @@ def postings(subscriber: Optional[str] = None, key: Optional[str] = None,
            COALESCE(pl.delivered_up_to, sent.delivered_up_to) AS delivered_up_to,
            sent.sent_up_to, sent.inflight_version,
            pl.status,
-           (pl.status = 'LAGGING') AS gated,
+           ((pl.status = 'LAGGING'
+              AND NOT EXISTS (
+                  SELECT 1 FROM reconciliation_settlements rs
+                  WHERE rs.subscriber_id = s.id
+                    AND rs.window_start = sent.window_start
+                    AND rs.key = sent.key
+                    AND rs.effect = 'CONTINUE'
+                    AND rs.status = 'ACTIVE'))
+             OR EXISTS (
+                  SELECT 1 FROM reconciliation_settlements rs
+                  WHERE rs.subscriber_id = s.id
+                    AND rs.window_start = sent.window_start
+                    AND rs.key = sent.key
+                    AND rs.status = 'ACTIVE'
+                    AND rs.effect IN ('FREEZE', 'SUPPRESS')
+                    AND sent.sent_up_to > rs.pinned_version)) AS gated,
+           rs.effect AS settlement_effect,
+           rs.status AS settlement_status,
+           rs.pinned_version AS pinned_version,
            pl.first_reported_at, pl.updated_at AS ledger_updated_at
     FROM sent
     JOIN subscribers s ON s.id = sent.subscriber_id
     LEFT JOIN posting_ledger pl
       ON pl.subscriber_id = sent.subscriber_id
      AND pl.window_start = sent.window_start
-     AND pl.key = sent.key"""
+     AND pl.key = sent.key
+    LEFT JOIN reconciliation_settlements rs
+      ON rs.subscriber_id = sent.subscriber_id
+     AND rs.window_start = sent.window_start
+     AND rs.key = sent.key"""
     conds, args = [], []
     if subscriber is not None:
         conds.append("s.name = %s")
@@ -3117,7 +3483,9 @@ def reconciliation_list(subscriber_id: Optional[int] = None,
     sql = """
     SELECT b.*, s.name AS subscriber, s.url,
            b.total_items - b.aligned_items
-               - b.confirmed_items - b.rejected_items AS unresolved_items
+               - b.confirmed_items - b.rejected_items AS unresolved_items,
+           (SELECT count(*) FROM reconciliation_settlements st
+             WHERE st.batch_id = b.id) AS settled_items
     FROM reconciliation_batches b
     JOIN subscribers s ON s.id = b.subscriber_id"""
     conds, args = [], []
@@ -3281,3 +3649,82 @@ def reconciliation_events(batch_id: int, limit: int = Query(default=1000)):
     finally:
         conn.close()
     return {"batch_id": batch_id, "events": events}
+
+
+# ---------------------------------------------------------------------------
+# reconciliation settlements (对账落账): which pair has landed, pinned where
+# ---------------------------------------------------------------------------
+
+@app.get("/settlements")
+def settlements(batch_id: Optional[int] = None,
+                subscriber_id: Optional[int] = None,
+                subscriber: Optional[str] = None,
+                key: Optional[str] = None,
+                window_start: Optional[int] = None,
+                effect: Optional[str] = None,
+                status: Optional[str] = None,
+                active_only: bool = False,
+                limit: int = Query(default=500)):
+    """The settled verdict of every adjudicated pair — answer to
+    "这一批每条落到没有、钉在哪一版".
+
+    One immutable row per (subscriber, window, key): the CLOSED batch that
+    settled it, the effect applied at close (FREEZE / CONTINUE / SUPPRESS /
+    REDRIVE / MARK_DELIVERED / NONE), the version it is pinned at and whether
+    the settlement is still ACTIVE or already FULFILLED (a REDRIVE whose pin
+    was reported, or a CONTINUE whose downstream caught up). Filters:
+    batch_id / subscriber / key / window_start / effect / status /
+    active_only.
+    """
+    if effect is not None and effect not in (
+            "FREEZE", "CONTINUE", "SUPPRESS", "REDRIVE",
+            "MARK_DELIVERED", "NONE"):
+        raise HTTPException(
+            422, "effect must be FREEZE, CONTINUE, SUPPRESS, REDRIVE, "
+                 "MARK_DELIVERED or NONE")
+    if status is not None and status not in ("ACTIVE", "FULFILLED"):
+        raise HTTPException(422, "status must be ACTIVE or FULFILLED")
+    sql = """
+    SELECT st.*, s.name AS subscriber, s.url,
+           rb.window_start_from AS batch_window_start_from,
+           rb.window_start_to AS batch_window_start_to,
+           rb.created_by AS batch_created_by
+    FROM reconciliation_settlements st
+    JOIN subscribers s ON s.id = st.subscriber_id
+    JOIN reconciliation_batches rb ON rb.id = st.batch_id"""
+    conds, args = [], []
+    if batch_id is not None:
+        conds.append("st.batch_id = %s")
+        args.append(batch_id)
+    if subscriber_id is not None:
+        conds.append("st.subscriber_id = %s")
+        args.append(subscriber_id)
+    if subscriber is not None:
+        conds.append("s.name = %s")
+        args.append(subscriber)
+    if key is not None:
+        conds.append("st.key = %s")
+        args.append(key)
+    if window_start is not None:
+        conds.append("st.window_start = %s")
+        args.append(window_start)
+    if effect is not None:
+        conds.append("st.effect = %s")
+        args.append(effect)
+    if status is not None:
+        conds.append("st.status = %s")
+        args.append(status)
+    if active_only:
+        conds.append("st.status = 'ACTIVE'")
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY st.id DESC LIMIT %s"
+    args.append(min(max(limit, 1), 5000))
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, args)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {"settlements": rows, "count": len(rows)}

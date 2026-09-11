@@ -332,6 +332,121 @@ def reconciliation_can_close(items):
                for status, decision in items)
 
 
+# ---------------------------------------------------------------------------
+# Settlement of closed reconciliation batches (对账落账)
+#
+# Verdicts recorded while a batch is OPEN change nothing — they are only the
+# reconciliation outcome on the frozen photograph. When the batch closes, each
+# adjudicated non-aligned item is *settled* exactly once into an immutable
+# reconciliation_settlements row keyed by (subscriber, window, key), and from
+# that moment the verdict drives delivery and posting reports for that one
+# pair:
+#
+# item class \\ decision   CONFIRMED (认)                REJECTED (驳)
+# LAGGING                  FREEZE: pin at the version    CONTINUE: keep
+#                          it reported at snapshot time; sending every version
+#                          later versions are never sent  we sent; the lagging
+#                          to this downstream and reports gate never holds this
+#                          above the pin are rejected     pair again
+# NOT_REPORTED             SUPPRESS: pin at 0 — this      REDRIVE: pin at the
+#                          version is never (re)delivered, lowest sent version,
+#                          backfill never copies it, and  which is re-driven
+#                          every report is rejected        until it reports it
+# AHEAD_UNCONFIRMED        MARK_DELIVERED: the in-flight  NONE: ordinary
+#                          versions up to its reported     retries continue
+#                          version are confirmed at close
+#
+# "同一条只能落到一次" is the UNIQUE(subscriber, window, key) constraint: a
+# later batch whose close would settle an already-settled pair fails 409.
+# Everything is scoped to one pair — other subscribers, other results and
+# other windows of the same key are never affected.
+# ---------------------------------------------------------------------------
+
+SETTLEMENT_EFFECTS = ("FREEZE", "CONTINUE", "SUPPRESS", "REDRIVE",
+                      "MARK_DELIVERED", "NONE")
+SETTLEMENT_STATUSES = ("ACTIVE", "FULFILLED")
+
+# Effects that hold back not-yet-delivered versions above their pin.
+SETTLEMENT_HOLD_EFFECTS = ("FREEZE", "SUPPRESS")
+
+
+def settlement_effect(item_status, decision):
+    """Map a frozen snapshot bucket + its closed verdict to the delivery/
+    reporting effect settled at batch close.
+
+    ALIGNED items are never adjudicated and therefore never settled; asking
+    for their effect is a caller error."""
+    if item_status == "LAGGING":
+        return "FREEZE" if decision == "CONFIRMED" else "CONTINUE"
+    if item_status == "NOT_REPORTED":
+        return "SUPPRESS" if decision == "CONFIRMED" else "REDRIVE"
+    if item_status == "AHEAD_UNCONFIRMED":
+        return "MARK_DELIVERED" if decision == "CONFIRMED" else "NONE"
+    raise ValueError(f"item_status {item_status!r} is never settled")
+
+
+def settlement_pin_version(effect, reported_version, lowest_sent_version):
+    """The version a settlement pins the pair at.
+
+    - SUPPRESS (认它没入过) pins at 0: not even the first version may be
+      (re)delivered or reported;
+    - REDRIVE (不认它没入过) pins at the lowest version we ever sent — that is
+      the version re-driven until the downstream reports it;
+    - every other effect pins at the version the downstream reported at
+      snapshot time (FREEZE/CONTINUE) / at close acceptance (MARK_DELIVERED);
+      NONE carries the reported version for the record only.
+    """
+    if effect == "SUPPRESS":
+        return 0
+    if effect == "REDRIVE":
+        return lowest_sent_version
+    return reported_version
+
+
+def settlement_blocks_report(effect, settlement_status, pinned_version, version):
+    """Whether a posting report is rejected by a settled pair.
+
+    Returns None when the report may pass through the ordinary ledger rules,
+    or a machine-readable rejection reason string:
+
+    - FREEZE: the pair stands at the pinned (then-reported) version forever —
+      only an idempotent re-report of that exact version is accepted;
+    - SUPPRESS: the downstream never booked it and that is now the settled
+      truth — no report of any version can succeed;
+    - REDRIVE: while the re-driven pin version is still unreported, a report
+      below it cannot count (ordinary delivery rules normally reject those
+      first — this is the belt-and-braces check).
+    FULFILLED settlements and non-gating effects never block.
+    """
+    if settlement_status != "ACTIVE":
+        return None
+    if effect == "FREEZE":
+        return None if version == pinned_version else "frozen_by_settlement"
+    if effect == "SUPPRESS":
+        return "suppressed_by_settlement"
+    if effect == "REDRIVE" and version < pinned_version:
+        return "below_redrive_pin"
+    return None
+
+
+def settlement_fulfils(effect, settlement_status, pinned_version, version):
+    """Whether an accepted posting report discharges an ACTIVE settlement.
+
+    REDRIVE is fulfilled once the downstream reports the re-driven pin version
+    (or above — it cannot report above without the pin having been on the
+    wire); CONTINUE is fulfilled once its reports move past the version it was
+    lagging at, i.e. the dispute is over. FREEZE / SUPPRESS stay ACTIVE
+    forever; MARK_DELIVERED / NONE are born FULFILLED.
+    """
+    if settlement_status != "ACTIVE":
+        return False
+    if effect == "REDRIVE":
+        return version >= pinned_version
+    if effect == "CONTINUE":
+        return version > pinned_version
+    return False
+
+
 def ranges_overlap(from_a, to_a, from_b, to_b):
     """Half-open interval overlap: [from_a, to_a) vs [from_b, to_b)."""
     return from_a < to_b and from_b < to_a

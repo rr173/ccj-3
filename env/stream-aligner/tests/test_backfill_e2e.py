@@ -88,8 +88,8 @@ def get(base, path, **params):
     return req("GET", base, path)
 
 
-def post(base, path, body):
-    return req("POST", base, path, body)
+def post(base, path, body=None):
+    return req("POST", base, path, body or {})
 
 
 def wait_for(name, fn, timeout=45):
