@@ -264,6 +264,28 @@ def main():
           items[(ws, k_aligned)]["rejected_reports"] == []
           and lag["rejected_reports"] == [], "unexpected rejected reports")
 
+    # -- filters work straight after opening (regression: a doubled WHERE made
+    # every filtered/single-item lookup fail with a SQL syntax error) ---------
+    lagging = batch_items(bid, item_status="LAGGING")
+    check("filter item_status=LAGGING returns exactly the one row",
+          [(i["window_start"], i["key"]) for i in lagging] == [(ws, k_lag)], str(lagging))
+    not_reported = batch_items(bid, item_status="NOT_REPORTED")
+    check("filter item_status=NOT_REPORTED returns exactly the one row",
+          [(i["window_start"], i["key"]) for i in not_reported] == [(ws, k_norep)],
+          str(not_reported))
+    check("undecided_only at opening = every non-aligned row",
+          {(i["window_start"], i["key"]) for i in batch_items(bid, undecided_only=True)}
+          == {(ws, k_lag), (ws, k_norep)}, "unexpected undecided set")
+    one = batch_items(bid, window_start=ws, key=k_lag)
+    check("looking one single item up by window_start+key works",
+          len(one) == 1 and one[0]["item_status"] == "LAGGING", str(one))
+    aligned = batch_items(bid, item_status="ALIGNED")
+    check("ALIGNED filter returns the two aligned rows",
+          sorted(i["key"] for i in aligned) == sorted([k_aligned, k_ahead]), str(aligned))
+    none_rows = batch_items(bid, item_status="AHEAD_UNCONFIRMED")
+    check("a matching-nothing bucket comes back empty, not an error",
+          none_rows == [], str(none_rows))
+
     # -- the dead downstream's own batch sees AHEAD_UNCONFIRMED ----------------
     # DEAD registered before k_lag's v2 correction, so post-registration
     # versions fan out to it too (never its missing v1 — that is backfill's

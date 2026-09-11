@@ -1850,7 +1850,7 @@ LEFT JOIN posting_ledger pl
   ON pl.subscriber_id = b.subscriber_id
  AND pl.window_start = i.window_start AND pl.key = i.key
 WHERE i.batch_id = %s
-{conds}
+{extra_conds}
 ORDER BY i.window_start, i.key
 LIMIT %s
 """
@@ -3198,7 +3198,11 @@ def reconciliation_items(batch_id: int, key: Optional[str] = None,
         args.append(decision)
     if undecided_only:
         conds.append("i.item_status <> 'ALIGNED' AND i.decision IS NULL")
-    sql = RECON_ITEMS_SQL.format(conds=(" WHERE " + " AND ".join(conds)) if conds else "")
+    # The template already carries `WHERE i.batch_id = %s`; appended filters
+    # must be AND-joined, never a second WHERE (which is a syntax error that
+    # breaks every filtered/single-item lookup).
+    sql = RECON_ITEMS_SQL.format(
+        extra_conds=(" AND " + " AND ".join(conds)) if conds else "")
     args.append(min(max(limit, 1), 5000))
     conn = connect()
     try:
