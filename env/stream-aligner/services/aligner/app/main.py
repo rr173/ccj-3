@@ -1478,12 +1478,17 @@ def set_gate(conn, key, open_):
 def grant_window_grace(conn, window_start, key, extra_ms, created_by=None, note=None):
     """Grant one ACTIVE close grace to a single (window, key).
 
-    Returns the new grace row (RealDict) or raises HTTPException: 404 when the
+    Returns the new grace row (dict) or raises HTTPException: 404 when the
     window has no effective data yet (nothing to wait for), 409 when the
     window already emitted a result or already has an ACTIVE grace.
     """
     window_end = window_start + WINDOW_MS
-    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    # Plain cursor: get_head()/effective_data_sides() unpack rows positionally
+    # (a RealDictCursor would make the former KeyError on row[0] and turn the
+    # latter's tuple unpacking into dict-key iteration — the 500/404 this
+    # function used to return). The inserted row is re-dictified for the
+    # response below.
+    with conn, conn.cursor() as cur:
         # Same lock order as emit(): gate row first, grace rows second.
         cur.execute(
             "INSERT INTO release_gates (key) VALUES (%s) ON CONFLICT (key) DO NOTHING",
@@ -1500,12 +1505,12 @@ def grant_window_grace(conn, window_start, key, extra_ms, created_by=None, note=
             (window_start, key),
         )
         grace_rows = cur.fetchall()
-        if any(r["status"] == "ACTIVE" for r in grace_rows):
-            active = next(r for r in grace_rows if r["status"] == "ACTIVE")
+        if any(r[1] == "ACTIVE" for r in grace_rows):
+            active = next(r for r in grace_rows if r[1] == "ACTIVE")
             raise HTTPException(
                 409,
                 f"window {window_start} of key {key!r} already has ACTIVE grace "
-                f"{active['id']} that has not come due (同一窗不能叠两条还没到期的宽限)")
+                f"{active[0]} that has not come due (同一窗不能叠两条还没到期的宽限)")
         head = get_head(cur, window_start, key)
         has_data = (key, window_start) in effective_data_sides(cur, key)
         # The ACTIVE check was already done above under the row locks (plus a
@@ -1531,7 +1536,7 @@ def grant_window_grace(conn, window_start, key, extra_ms, created_by=None, note=
                RETURNING *""",
             (window_start, window_end, key, extra_ms, extra_ms, created_by, note),
         )
-        row = cur.fetchone()
+        row = dict(zip([d[0] for d in cur.description], cur.fetchone()))
     log.info("close grace %s granted to window=%d key=%s extra=%dms due=%s",
              row["id"], window_start, key, extra_ms, row["due_at"])
     return row
