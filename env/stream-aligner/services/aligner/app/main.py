@@ -72,10 +72,23 @@ live_* columns beside them. Each photographed pair is bucketed ALIGNED,
 LAGGING, AHEAD_UNCONFIRMED or NOT_REPORTED (sent but never reported);
 ALIGNED rows need no action while every other row must be adjudicated
 one by one — CONFIRMED (认账) or REJECTED (驳) — before the batch can close,
-and a verdict never moves the ledger or the outbox. Two OPEN batches of the
-same subscriber cannot cover overlapping windows; after closing, verdicts
-are frozen too, and a new batch may reopen the same range and photograph the
-then-current state.
+and a verdict never moves the ledger or the outbox WHILE THE BATCH IS OPEN.
+Closing a batch *settles* every adjudicated item (对账落账): one immutable
+reconciliation_settlements row per (subscriber, window, key), so the same
+pair can land exactly once ("同一条只能落到一次"), and the verdict only then
+starts driving delivery and reports. A LAGGING item CONFIRMED is FROZEN at
+the version it reported (later versions are parked, reports above the pin
+rejected); REJECTED it CONTINUES (the lagging gate never holds that pair
+again). A NOT_REPORTED item CONFIRMED is SUPPRESSED at version 0 (never
+re-delivered, never copied by a later backfill, every report rejected);
+REJECTED it is RE-DRIVEN — the pinned sent version is POSTED again as a new
+outbox generation (new delivery_id, same result version, redelivery_seq>=1,
+even when the old row already showed DELIVERED, since "sent" never means "it
+booked it") until the downstream reports it, then normal flow resumes. An
+AHEAD_UNCONFIRMED item CONFIRMED marks its retrying version DELIVERED at
+close and aligns the ledger. Two OPEN batches of the same subscriber cannot
+cover overlapping windows; after closing, verdicts are frozen too, and a new
+batch may reopen the same range and photograph the then-current state.
 """
 import json
 import logging
@@ -97,8 +110,7 @@ from app.core import (ORDER_STATUSES, POSTING_STATUSES, build_order_snapshot,
                       normalize_backfill_range, order_reason, posting_status,
                       ranges_overlap, reconciliation_can_close,
                       reconciliation_item_status, released_version_kind,
-                      reportable_delivery_status, retry_delay_ms,
-                      settlement_blocks_report, settlement_effect,
+                      retry_delay_ms, settlement_blocks_report, settlement_effect,
                       settlement_fulfils, settlement_pin_version,
                       should_deliver, side_evidence, window_of, window_ready)
 
@@ -230,6 +242,24 @@ CREATE INDEX IF NOT EXISTS deliveries_subscriber_channel_idx
 CREATE INDEX IF NOT EXISTS deliveries_backfill_job_idx
     ON deliveries (backfill_job_id, id)
     WHERE backfill_job_id IS NOT NULL;
+-- Re-delivery generations (再送). A CLOSED reconciliation batch's REDRIVE
+-- settlement ("不认它没入过") must RE-POST a version the records already show
+-- as DELIVERED: at-least-once re-delivery is a brand-new outbox row with a new
+-- delivery_id (otherwise a downstream de-duplicating by delivery_id drops it),
+-- while keeping the same result version. seq 0 = the original send; a redrive
+-- copies the same version as seq 1. Redrive copies never block or get blocked
+-- by the version-order barrier (they are a re-presentation of an already-sent
+-- version, not the next version), so later versions keep flowing.
+ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS redelivery_seq INT NOT NULL DEFAULT 0;
+ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS
+    deliveries_subscriber_id_window_start_key_version_key;
+DO $$
+BEGIN
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_identity_uq
+        UNIQUE (subscriber_id, window_start, key, version, redelivery_seq);
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END $$;
 CREATE TABLE IF NOT EXISTS backfill_jobs (
     id                 BIGSERIAL PRIMARY KEY,
     subscriber_id      BIGINT NOT NULL REFERENCES subscribers(id),
@@ -720,7 +750,7 @@ def emit(conn, window_start, key, reason, detail):
             """INSERT INTO deliveries (subscriber_id, window_start, window_end, key,
                                        version, kind, payload)
                SELECT s.id, %s, %s, %s, %s, %s, %s FROM subscribers s
-               ON CONFLICT (subscriber_id, window_start, key, version) DO NOTHING""",
+               ON CONFLICT (subscriber_id, window_start, key, version, redelivery_seq) DO NOTHING""",
             (window_start, window_end, key, nxt["version"], kind,
              psycopg2.extras.Json(payload) if payload is not None else None),
         )
@@ -1146,7 +1176,7 @@ def publish_heads(cur, key, rows, action):
             """INSERT INTO deliveries (subscriber_id, window_start, window_end, key,
                                        version, kind, payload)
                SELECT s.id, %s, %s, %s, %s, 'NEW', %s FROM subscribers s
-               ON CONFLICT (subscriber_id, window_start, key, version) DO NOTHING""",
+               ON CONFLICT (subscriber_id, window_start, key, version, redelivery_seq) DO NOTHING""",
             (ws, we, key, version, psycopg2.extras.Json(payload)),
         )
         released.append({"window_start": ws, "window_end": we, "version": version})
@@ -1363,7 +1393,7 @@ def create_backfill(conn, subscriber_id, window_start_from, window_start_to):
                        (subscriber_id, window_start, window_end, key, version,
                         kind, payload, channel, backfill_job_id, created_at)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'BACKFILL', %s, %s)
-                   ON CONFLICT (subscriber_id, window_start, key, version) DO NOTHING""",
+                   ON CONFLICT (subscriber_id, window_start, key, version, redelivery_seq) DO NOTHING""",
                 (subscriber_id, r["window_start"], r["window_end"], r["key"],
                  r["version"], kind,
                  psycopg2.extras.Json(r["payload"]) if r["payload"] is not None else None,
@@ -1535,13 +1565,16 @@ def report_posting(conn, subscriber_id, window_start, key, version):
         cur.execute("SELECT 1 FROM subscribers WHERE id = %s FOR UPDATE",
                     (subscriber_id,))
         cur.execute(
-            """SELECT status FROM deliveries
+            """SELECT bool_or(status IN ('DELIVERED', 'RETRYING')) AS dispatched,
+                      bool_or(status = 'PENDING') AS any_pending,
+                      count(*) AS rows
+               FROM deliveries
                WHERE subscriber_id = %s AND window_start = %s
                  AND key = %s AND version = %s""",
             (subscriber_id, window_start, key, version),
         )
         sent = cur.fetchone()
-        dispatched = sent is not None and reportable_delivery_status(sent["status"])
+        dispatched = bool(sent["rows"]) and sent["dispatched"]
         cur.execute(
             """SELECT reported_version, delivered_up_to, status FROM posting_ledger
                WHERE subscriber_id = %s AND window_start = %s AND key = %s
@@ -1556,9 +1589,9 @@ def report_posting(conn, subscriber_id, window_start, key, version):
             # still held undelivered): the report cannot count. Trace the
             # rejection, change nothing.
             detail = ({"reason": "version_never_sent_to_subscriber"}
-                      if sent is None else
+                      if sent["rows"] == 0 else
                       {"reason": "version_not_yet_delivered",
-                       "delivery_status": sent["status"]})
+                       "delivery_status": "PENDING"})
             record_posting_event(
                 cur, subscriber_id, window_start, key, "REPORT_REJECTED",
                 version, prev, prev or (None, None, None), detail)
@@ -1670,9 +1703,10 @@ ladder AS (
            jsonb_agg(jsonb_build_object(
                         'version', d.version, 'kind', d.kind,
                         'status', d.status, 'channel', d.channel,
+                        'redelivery_seq', d.redelivery_seq,
                         'attempts', d.attempts, 'last_error', d.last_error,
                         'delivered_at', d.delivered_at)
-                    ORDER BY d.version) AS delivery_ladder
+                    ORDER BY d.version, d.redelivery_seq) AS delivery_ladder
     FROM deliveries d
     WHERE d.subscriber_id = %s
       AND d.window_start >= %s AND d.window_start < %s
@@ -2044,18 +2078,49 @@ def apply_settlement_effect(cur, batch, item, effect, pin, operator):
 
     if effect == "REDRIVE":
         # Re-drive the lowest sent version until the downstream reports it.
-        # Reset that one outbox row to PENDING (it becomes due immediately);
-        # later versions stay gated behind it by the normal version-order
-        # barrier. If it is somehow already DELIVERED, nothing needs redoing.
+        # If the pinned version was already DELIVERED once (the usual
+        # NOT_REPORTED case: we confirm sending it, it never booked it),
+        # merely resetting the old row would not re-POST and a reused
+        # delivery_id would be dropped by a delivery_id-deduplicating
+        # downstream — insert a NEW outbox row for the SAME version
+        # (new id, redelivery_seq = previous max + 1). It carries the same
+        # (window, key, version) identity so the downstream books/amends that
+        # one result, not a new success. If the original row is still
+        # PENDING/RETRYING, no copy is needed: just make it due immediately.
+        # A re-delivery never enters the version-order barrier
+        # (redelivery_seq <> 0), so later versions are not held back by it.
         cur.execute(
-            """UPDATE deliveries
-               SET status = 'PENDING', last_attempt_at = NULL,
-                   delivered_at = NULL, next_attempt_at = now(), last_error = NULL,
-                   attempts = 0
+            """SELECT status, window_end, kind, payload, COALESCE(
+                      (SELECT max(redelivery_seq) FROM deliveries d2
+                        WHERE d2.subscriber_id = d.subscriber_id
+                          AND d2.window_start = d.window_start
+                          AND d2.key = d.key AND d2.version = d.version), 0)
+                      AS max_seq
+               FROM deliveries d
                WHERE subscriber_id = %s AND window_start = %s AND key = %s
-                 AND version = %s AND status <> 'DELIVERED'""",
+                 AND version = %s AND redelivery_seq = 0""",
             (sub_id, ws, key, pin),
         )
+        pin_row = cur.fetchone()
+        if pin_row is not None and pin_row["status"] == "DELIVERED":
+            cur.execute(
+                """INSERT INTO deliveries
+                       (subscriber_id, window_start, window_end, key, version,
+                        kind, payload, channel, redelivery_seq, next_attempt_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, 'REALTIME', %s, now())""",
+                (sub_id, ws, pin_row["window_end"], key, pin, pin_row["kind"],
+                 psycopg2.extras.Json(pin_row["payload"])
+                 if pin_row["payload"] is not None else None,
+                 pin_row["max_seq"] + 1),
+            )
+        elif pin_row is not None:
+            cur.execute(
+                """UPDATE deliveries
+                   SET next_attempt_at = now(), last_error = NULL
+                   WHERE subscriber_id = %s AND window_start = %s AND key = %s
+                     AND version = %s AND redelivery_seq = 0""",
+                (sub_id, ws, key, pin),
+            )
 
     if effect == "MARK_DELIVERED":
         # It reported the pin version while our delivery of it was still
@@ -2188,7 +2253,8 @@ def reconcile_item_live(row):
 DUE_SQL = """
 SELECT d.id, d.subscriber_id, s.name AS subscriber, s.url,
        d.window_start, d.window_end, d.key, d.version, d.kind, d.payload,
-       d.attempts, d.created_at, d.channel, d.backfill_job_id
+       d.attempts, d.created_at, d.channel, d.backfill_job_id,
+       d.redelivery_seq
 FROM deliveries d
 JOIN subscribers s ON s.id = d.subscriber_id
 WHERE s.active
@@ -2204,6 +2270,7 @@ WHERE s.active
         AND p.key = d.key
         AND p.version < d.version
         AND p.status <> 'DELIVERED'
+        AND p.redelivery_seq = 0
   )
   AND NOT EXISTS (
       -- posting-ledger flow control: this downstream's posted position lags
@@ -2250,7 +2317,8 @@ LIMIT %s
 BACKFILL_DUE_SQL = """
 SELECT d.id, d.subscriber_id, s.name AS subscriber, s.url,
        d.window_start, d.window_end, d.key, d.version, d.kind, d.payload,
-       d.attempts, d.created_at, d.channel, d.backfill_job_id
+       d.attempts, d.created_at, d.channel, d.backfill_job_id,
+       d.redelivery_seq
 FROM deliveries d
 JOIN subscribers s ON s.id = d.subscriber_id
 JOIN backfill_jobs j ON j.id = d.backfill_job_id
@@ -2271,6 +2339,7 @@ WHERE s.active
         AND p.key = d.key
         AND p.version < d.version
         AND p.status <> 'DELIVERED'
+        AND p.redelivery_seq = 0
   )
   AND NOT EXISTS (
       -- the posting-ledger gate applies to replays exactly as to live
@@ -2327,6 +2396,7 @@ def deliver_one(conn, row):
         "emitted_at": row["created_at"].isoformat() if row["created_at"] else None,
         "channel": row.get("channel", "REALTIME"),
         "backfill_job_id": row.get("backfill_job_id"),
+        "redelivery_seq": row.get("redelivery_seq", 0),
     }
     attempts = row["attempts"] + 1
     try:
@@ -3109,7 +3179,7 @@ def resume_backfill_endpoint(job_id: int):
 DELIVERY_COLS = """d.id, s.name AS subscriber, s.url, d.window_start, d.window_end, d.key,
                    d.version, d.kind, d.status, d.attempts, d.last_error,
                    d.next_attempt_at, d.last_attempt_at, d.delivered_at, d.created_at,
-                   d.channel, d.backfill_job_id"""
+                   d.channel, d.backfill_job_id, d.redelivery_seq"""
 
 
 @app.get("/deliveries")
@@ -3191,6 +3261,7 @@ def result_delivery(window_start: int, key: str):
             "attempts": r["attempts"], "last_error": r["last_error"],
             "next_attempt_at": r["next_attempt_at"], "delivered_at": r["delivered_at"],
             "channel": r["channel"], "backfill_job_id": r["backfill_job_id"],
+            "redelivery_seq": r["redelivery_seq"],
         })
     for sub in by_sub.values():
         for v in sub["versions"]:

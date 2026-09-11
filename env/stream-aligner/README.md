@@ -76,8 +76,13 @@
 ```json
 {"delivery_id": 12345, "kind": "CORRECTION",
  "window_start": 1736000000000, "window_end": 1736000060000, "key": "order-1",
- "version": 2, "payload": {...}, "emitted_at": "2026-01-04T17:00:05.123456+00:00"}
+ "version": 2, "payload": {...}, "emitted_at": "2026-01-04T17:00:05.123456+00:00",
+ "channel": "REALTIME", "backfill_job_id": null, "redelivery_seq": 0}
 ```
+
+`redelivery_seq` 为投递代次：0 = 原始投递；对账批次结掉一笔"送了但它没入过"且裁决为**驳**（REDRIVE）时，
+同一版本会作为新投递再 POST 一次，拿到全新的 `delivery_id`、`redelivery_seq=1`（详见"认/驳落账"）。
+下游按 `delivery_id` 做 HTTP 重发去重、按 `(window_start, key, version)` 做业务幂等，两者都不受影响。
 
 下游契约：以 `(window_start, key)` 为同一笔结果的标识；`NEW` 入账、`CORRECTION` 按版本
 接着改同一笔、`WITHDRAWAL` 整笔冲销；`version <= 已应用版本` 的消息直接丢弃（幂等）。
@@ -113,7 +118,8 @@
 | `GET /backfills/{id}` | 单个任务状态与计数 |
 | `POST /backfills/{id}/stop` / `/resume` | 暂停 / 继续；对已完成任务操作是幂等 no-op |
 
-投递信封与实时通道一致，只多带 `channel="BACKFILL"` 与 `backfill_job_id`；下游按同一套
+投递信封与实时通道一致，只多带 `channel="BACKFILL"` 与 `backfill_job_id`（所有信封另带
+`redelivery_seq`，0 = 原始投递、≥1 = 对账结掉后的 REDRIVE 再送）；下游按同一套
 `(window_start, key, version)` 契约入账即可，无需区分通道。
 
 ## 下游入账台账（posting ledger）
@@ -169,7 +175,32 @@
 | 结掉即封口 | 批次 `CLOSED` 后认驳不能再录也不能改（`409`）；重复结账是幂等 no-op，不重复写事件 |
 | 同一区间只开一笔 | 同一下游两个 `OPEN` 批次的窗口区间不得重叠（半开区间按吸附后的窗口边界比较，`409`）；在 subscriber 行锁内检查，并发开账也不会漏；相邻/不相交区间、不同下游互不影响；**结掉的批次永不挡新账**，同一区间可以再开一笔拍当下的新照片 |
 | 空批次 | 区间内没有任何投递行 → 0 条目批次，可以立刻结掉 |
-| 全程留痕 | `reconciliation_events` 只增：`BATCH_OPENED`（含各类计数）/ `ITEM_DECIDED`（哪笔、新裁决、旧裁决、操作人、备注）/ `BATCH_CLOSED` |
+| 全程留痕 | `reconciliation_events` 只增：`BATCH_OPENED`（含各类计数）/ `ITEM_DECIDED`（哪笔、新裁决、旧裁决、操作人、备注）/ `BATCH_CLOSED`（含本批落账清单） |
+
+## 认/驳落账（settlement）
+
+结掉之前，认/驳只是写在批次快照上的结论，**不动投递、不动台账、不挡申报**；结掉那一刻，每条有裁决的条目在同一事务里"落"成一条
+`reconciliation_settlements`（`(下游, 窗口, key)` 全局唯一），从这一刻起裁决才驱动后面怎么送、怎么报。
+
+| 开账时的类 | 认（CONFIRMED） | 驳（REJECTED） |
+|---|---|---|
+| `LAGGING`（它没跟上） | **FREEZE**：就认它那本账，钉在它当时报到的那一版；结账时还没确认送达（PENDING/RETRYING）的后续版收回 PENDING 永不再投，以后报高于钉版的申报一律 `409`；钉版的幂等重报仍接受。结账前已确认 DELIVERED 的版本是既成事实、不回滚（送出去的不能当没送过） | **CONTINUE**：不认它没跟上，按我送到的接着送——台账落后闸门对这一笔永久放行，不能因为它当时没报就把后面扣住；它报到钉版之后即 FULFILLED |
+| `NOT_REPORTED`（它没入过） | **SUPPRESS**：钉在 0，这一版别再补（实时、重试、补推都不再给它），以后它报这一版也不算成功（申报 `409` 且留痕）；结账时还在途的行收回 PENDING 永不再派 | **REDRIVE**：钉在最早送出去的那一版，**再给它一次**——即使旧投递行已是 DELIVERED 也会产生一条**新的投递**（新 `delivery_id`、版本号不变、`redelivery_seq=1`，下游按 delivery_id 不会把它当重发丢掉、按 version 订正同一笔），按退避重发直到它报到这一版；报到即 FULFILLED，恢复正常 |
+| `AHEAD_UNCONFIRMED`（对上了我还在重试） | **MARK_DELIVERED**：它既已认账，结账时把报到版及以下在途行直接置为 DELIVERED、台账补齐对齐（写一条 `SETTLEMENT_ADVANCED` 留痕） | **NONE**：照旧退避重试，落账行只记录"这一条驳过" |
+
+硬语义：
+
+| 规则 | 保证 |
+|---|---|
+| 结之前不动 | OPEN 期间改判多少次都不产生投递变化；只有 close 事务落账并执行效果 |
+| 同一条只能落到一次 | `UNIQUE(subscriber, window_start, key)`：后来的批次若要对同一笔再落账，close 返回 `409` 并点名是哪一批落过（FULFILLED 的也算历史，不挡查询、仍挡重复落账） |
+| 钉版可查 | `GET /settlements` 回答"每条落到没有、钉在哪一版、谁结的、ACTIVE 还是已 FULFILLED"；批次条目、台账、投递阶梯都带落账效果与钉版 |
+| 再送是真再送 | REDRIVE 不复活旧行（旧 delivery_id 会被下游去重吞掉），而是插新一代 outbox 行；再送行不进版本序屏障（它是已出版本的再呈现，不是下一版），不拖累后续版本 |
+| 已送成功的不回滚 | FREEZE 只扣结账时还没 DELIVERED 的后续版；结账前已确认送达的投递行一条不改（送出去的不能当没送过） |
+| 补推也认钉版 | 新建 backfill 复制候选时跳过 ACTIVE 的 FREEZE/SUPPRESS 钉版之上的版本（SUPPRESS 钉 0，整笔都不复制） |
+| 只拖这一笔 | 所有闸门按 `(下游, 窗口, key)` 三元组生效：别的下游、别的 key、同 key 别的窗口照常投递与申报 |
+
+落账相关查询见下表 `GET /settlements`；批次条目、台账、投递阶梯也都带落账信息。
 
 | 方法/路径 | 说明 |
 |---|---|
@@ -178,8 +209,9 @@
 | `GET /reconciliations/{id}` | 单个批次头与计数（`unresolved_items=0` 即可结） |
 | `GET /reconciliations/{id}/items?item_status=&decision=&undecided_only=&key=&window_start=` | 批次条目：冻结快照 + 当下 `live_*` / `drifted`；`undecided_only=true` 列出还挡着结账的条目 |
 | `POST /reconciliations/{id}/decisions` | `{"window_start", "key", "decision": "CONFIRMED"|"REJECTED", "operator"?, "note"?}`：认/驳一条非对齐条目；OPEN 批次才能操作，ALIGNED 行返回 `409` |
-| `POST /reconciliations/{id}/close` | 结账：有未决条目返回 `409`；结掉后裁决冻结；重复结账幂等 |
-| `GET /reconciliations/{id}/events` | 该批次只增流水（开账 / 逐条认驳 / 结账），按时间正序 |
+| `POST /reconciliations/{id}/close` | 结账：有未决条目返回 `409`；结掉后裁决冻结；重复结账幂等。close 事务把每条裁决落成 settlement；同一笔已落过账返回 `409` |
+| `GET /reconciliations/{id}/events` | 该批次只增流水（开账 / 逐条认驳 / 结账，结账 detail 含落账清单），按时间正序 |
+| `GET /settlements?batch_id=&subscriber=&subscriber_id=&key=&window_start=&effect=&status=&active_only=` | 认/驳落账：每条落到没有、什么效果（FREEZE/CONTINUE/SUPPRESS/REDRIVE/MARK_DELIVERED/NONE）、钉在哪一版、ACTIVE/FULFILLED、哪个批次结的 |
 
 ## 对外放行（release gate）
 
@@ -299,6 +331,13 @@ no-op。
 | 结掉后再改认驳 | `409`：结账后裁决连同快照一起冻结；重复结账幂等 |
 | 同一下游同一段开两笔 | 两个 OPEN 批次区间重叠（半开、按吸附后的窗口边界）→ `409`；区间相邻/不相交、不同下游都可以；结掉后同一段可再开 |
 | 对账区间里一笔都没送过 | 0 条目空批次，可立刻结掉；从没发出的笔（无投递行）本来就不在对账范围 |
+| 开着账时就认/驳 | 裁决只写批次快照，投递/台账/申报一律不看它——结完才动 |
+| 认它没跟上（LAGGING+认） | 结账落 FREEZE：这一笔停在它报到的版本，结账时还没 DELIVERED 的后续版收回 PENDING 永不再投；报高于钉版的申报 409；结账前已送达的投递不回滚；别的下游、别的笔照送 |
+| 不认它没跟上（LAGGING+驳） | 结账落 CONTINUE：台账落后闸门对这一笔永久放行，被扣的后续版立刻照送；它报到钉版之后落账 FULFILLED |
+| 认它没入过（NOT_REPORTED+认） | 结账落 SUPPRESS 钉在 0：实时/重试/补推都不再给这一版；以后它报这一版也 409 不算成功 |
+| 不认它没入过（NOT_REPORTED+驳） | 结账落 REDRIVE：即使旧行已 DELIVERED 也插一条新投递（新 delivery_id、同版本、redelivery_seq=1）真再 POST 一次，直到它报到；报到即 FULFILLED 恢复正常 |
+| 认了"对上重试中"（AHEAD+认） | MARK_DELIVERED：结账时把报到版及以下在途行置 DELIVERED、台账对齐并留痕；驳了则无动作（NONE），照旧重试 |
+| 同一笔想落第二次账 | 后来批次的 close 返回 409 并点名已由哪批落过（FULFILLED 也算）；`GET /settlements` 可查每条钉在哪一版 |
 
 ## 快速开始
 
@@ -317,6 +356,9 @@ python3 tests/test_core.py       # 或 make unit —— 纯逻辑单测，无需
 未放行窗口继续扣）** → **下游入账台账（申报对齐 → 新投递打成落后并扣住后续版本 → 申报追平
 自动放行 → 报没送出过的版本被拒 → 全程留痕）** → **对账批次（开账拍四类快照 → 台账再变只
 动 live 列不回写快照 → 逐条认/驳，剩一条不让结 → 结掉后认驳冻结 → 同段重开拍当下）** →
+**认/驳落账（结之前不动投递；结账按 快照类×裁决 落 FREEZE / CONTINUE / SUPPRESS /
+REDRIVE / MARK_DELIVERED / NONE：落后认了钉在报到版、驳了接着送；没入过认了这版永不补、
+驳了用新 delivery_id 真再送一次直到报到；同一条只能落一次，可查每条钉在哪一版，别的笔不拖）** →
 业务单全生命周期（开着 → 等着 → 关了 → 被重开 → 作废 → 同一张单复活）。
 
 ## API 一览
@@ -375,8 +417,9 @@ python3 tests/test_core.py       # 或 make unit —— 纯逻辑单测，无需
 | `GET /reconciliations/{id}` | 单个批次状态（`unresolved_items=0` 才可结） |
 | `GET /reconciliations/{id}/items?item_status=&decision=&undecided_only=&key=&window_start=` | 批次条目：冻结快照 + `live_*` 当下状态 + `drifted` |
 | `POST /reconciliations/{id}/decisions` | 认/驳一条非对齐条目：`{"window_start", "key", "decision": "CONFIRMED"|"REJECTED", "operator"?, "note"?}`；ALIGNED 行、CLOSED 批次返回 `409` |
-| `POST /reconciliations/{id}/close` | 结账：有未决条目 `409`；结掉后认驳冻结；重复结账幂等 |
-| `GET /reconciliations/{id}/events` | 批次只增流水：开账 / 逐条认驳（含旧裁决）/ 结账，时间正序 |
+| `POST /reconciliations/{id}/close` | 结账：有未决条目 `409`；结掉后认驳冻结；重复结账幂等；close 事务把裁决落账，同一笔已落过账返回 `409` |
+| `GET /reconciliations/{id}/events` | 批次只增流水：开账 / 逐条认驳（含旧裁决）/ 结账（detail 含落账清单），时间正序 |
+| `GET /settlements?batch_id=&subscriber=&subscriber_id=&key=&window_start=&effect=&status=&active_only=` | 认/驳落账查询：每条 `(下游, 窗口, key)` 落到没有、效果（FREEZE/CONTINUE/SUPPRESS/REDRIVE/MARK_DELIVERED/NONE）、钉在哪一版、ACTIVE/FULFILLED、哪个批次结的 |
 | `GET /healthz` | 健康检查 |
 
 ## 配置
