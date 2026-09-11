@@ -154,6 +154,33 @@
 | `GET /postings?subscriber=&key=&window_start=&status=` | 台账：每个下游每一笔的报到版 / 送到版 / 状态 / 是否被扣（`gated`），含在途版本 `inflight_version` |
 | `GET /postings/history?subscriber=&window_start=&key=` | 只增台账流水：每次申报与每次被打落后的前后状态；按笔查时按时间正序，全局查时倒序 |
 
+## 对账批次（reconciliation batches）
+
+台账回答的是"**现在**平不平"；对账批次回答的是"**指定这一段、指定这个下游，开账那一刻每一笔是什么样，之后一条条认到结掉**"。
+
+开账（`POST /reconciliations`，指定下游 + 事件时间半开区间，边界与补推一样吸附成整窗）在**一个事务**里把这段里这个下游有过投递行的每一笔（窗口, key）拍成一张**永久快照**：送到哪一版（`sent_version`，任何状态投递行的最大版）、确认送到哪一版（`delivered_version`）、最低的在途版（`inflight_version`，PENDING/RETRYING）、它报到哪一版（`reported_version`），外加完整的逐版投递阶梯（`delivery_ladder`）与它被拒过的申报（`rejected_reports`）。快照在 subscriber 行锁内拍摄，投递不可能插在各列之间把照片撕成两半。
+
+| 规则 | 保证 |
+|---|---|
+| 开账即定格 | 快照列只在开账事务里写一次，之后台账再变——新投递、申报追平、回滚——**一律不回写**；快照之外另外给一组 `live_*` 列展示当下状态，`drifted=true` 表示与开账时已不同。照片永远回答"开账那一刻"，live 列回答"现在" |
+| 四类 | `ALIGNED`（对齐：报到版 == 确认送到版）/ `LAGGING`（落后：报到版 < 送到版）/ `AHEAD_UNCONFIRMED`（它对上了我还在重试：报到版 > 确认送到版，或还没任何确认）/ `NOT_REPORTED`（我送了它没报：有投递行但从没申报过）；送都没送出的笔（无投递行）不在批次里 |
+| 对齐的不用管 | `ALIGNED` 行没有认/驳入口（对它下认驳返回 `409`）；其余三类每一条都必须**一条条认或驳**，有一条没处理完这批不能结（`POST .../close` 返回 `409` 并带出未决条数） |
+| 认/驳只是结论 | `CONFIRMED`（认账）/ `REJECTED`（驳）只写这张批次快照的裁决列，**不动台账、不动投递**——它是对账结论，不是补报入账。开着时同一笔可以改判（每次改判留痕：旧裁决在流水里），重复相同裁决是幂等 no-op |
+| 结掉即封口 | 批次 `CLOSED` 后认驳不能再录也不能改（`409`）；重复结账是幂等 no-op，不重复写事件 |
+| 同一区间只开一笔 | 同一下游两个 `OPEN` 批次的窗口区间不得重叠（半开区间按吸附后的窗口边界比较，`409`）；在 subscriber 行锁内检查，并发开账也不会漏；相邻/不相交区间、不同下游互不影响；**结掉的批次永不挡新账**，同一区间可以再开一笔拍当下的新照片 |
+| 空批次 | 区间内没有任何投递行 → 0 条目批次，可以立刻结掉 |
+| 全程留痕 | `reconciliation_events` 只增：`BATCH_OPENED`（含各类计数）/ `ITEM_DECIDED`（哪笔、新裁决、旧裁决、操作人、备注）/ `BATCH_CLOSED` |
+
+| 方法/路径 | 说明 |
+|---|---|
+| `POST /reconciliations` | `{"subscriber_id" 或 "subscriber_name", "from_window_start", "to_window_start", "operator"?}`：事件时间半开区间，自动吸附窗口边界（与补推同规则）；返回批次头（含四类计数与 `unresolved_items`）和冻结快照条目 |
+| `GET /reconciliations?subscriber=&subscriber_id=&status=` | 批次列表（倒序），含各类计数、认/驳计数、未决条数 |
+| `GET /reconciliations/{id}` | 单个批次头与计数（`unresolved_items=0` 即可结） |
+| `GET /reconciliations/{id}/items?item_status=&decision=&undecided_only=&key=&window_start=` | 批次条目：冻结快照 + 当下 `live_*` / `drifted`；`undecided_only=true` 列出还挡着结账的条目 |
+| `POST /reconciliations/{id}/decisions` | `{"window_start", "key", "decision": "CONFIRMED"|"REJECTED", "operator"?, "note"?}`：认/驳一条非对齐条目；OPEN 批次才能操作，ALIGNED 行返回 `409` |
+| `POST /reconciliations/{id}/close` | 结账：有未决条目返回 `409`；结掉后裁决冻结；重复结账幂等 |
+| `GET /reconciliations/{id}/events` | 该批次只增流水（开账 / 逐条认驳 / 结账），按时间正序 |
+
 ## 对外放行（release gate）
 
 内部对齐结果（版本、审计、业务单）照算照查，但**默认不算对外给出**：没放行之前不会生成
@@ -266,6 +293,12 @@ no-op。
 | 报了没送到的版本 | 从没发出过、或还扣着未投（PENDING）的版本，申报一律被拒（409），台账不动；只有确认送到或已发出在重试的版本才算数。拒报本身留在台账流水里 |
 | 下游说自己回滚了 | 台账跟着退成落后，已送出的投递记录一条不抹；它重新追平前该笔后续版本扣住 |
 | 下游换了接收地址 | 同名重新登记 = 同一个下游：台账、流水、投递积压全挂在原 subscriber 上，换 URL 不算换下游 |
+| 开一笔对账批次 | 开账事务里把该下游区间内每笔的送到版/送达版/在途版/报到版 + 投递阶梯 + 被拒申报拍成不可变快照（四类：对齐/落后/对上重试中/送了没报），之后台账再变只动 live 列，快照永不回写 |
+| 快照后台账又变了 | 冻结列保持开账那一刻；查询额外给 `live_*` 与 `drifted`；新账要等这笔结掉后另开，新账拍的是当下 |
+| 批次里有一条没认驳完 | 非对齐条目必须逐条 CONFIRMED/REJECTED，剩一条未决 `close` 就是 `409`；ALIGNED 行不用管也不允许认驳 |
+| 结掉后再改认驳 | `409`：结账后裁决连同快照一起冻结；重复结账幂等 |
+| 同一下游同一段开两笔 | 两个 OPEN 批次区间重叠（半开、按吸附后的窗口边界）→ `409`；区间相邻/不相交、不同下游都可以；结掉后同一段可再开 |
+| 对账区间里一笔都没送过 | 0 条目空批次，可立刻结掉；从没发出的笔（无投递行）本来就不在对账范围 |
 
 ## 快速开始
 
@@ -273,7 +306,7 @@ no-op。
 cd stream-aligner
 docker compose up -d --build     # 或 make up
 bash scripts/demo.sh             # 或 make demo —— 完整演示下述所有场景
-python3 tests/test_e2e.py        # 或 make test —— 对运行中的栈做端到端断言（含业务单）
+python3 tests/test_e2e.py        # 或 make test —— 对运行中的栈做端到端断言（含业务单、对账批次）
 python3 tests/test_core.py       # 或 make unit —— 纯逻辑单测，无需任何依赖
 ```
 
@@ -282,8 +315,9 @@ python3 tests/test_core.py       # 或 make unit —— 纯逻辑单测，无需
 水位回拨 + 回拨期间继续订正（v4）→ 下游订阅登记、按版本顺序推送（NEW / CORRECTION）与投递
 状态查询 → **放行闸门全流程（扣着 → 开门冲放当时 head → 关门后已放行窗口的订正继续投、
 未放行窗口继续扣）** → **下游入账台账（申报对齐 → 新投递打成落后并扣住后续版本 → 申报追平
-自动放行 → 报没送出过的版本被拒 → 全程留痕）** → 业务单全生命周期（开着 → 等着 → 关了 →
-被重开 → 作废 → 同一张单复活）。
+自动放行 → 报没送出过的版本被拒 → 全程留痕）** → **对账批次（开账拍四类快照 → 台账再变只
+动 live 列不回写快照 → 逐条认/驳，剩一条不让结 → 结掉后认驳冻结 → 同段重开拍当下）** →
+业务单全生命周期（开着 → 等着 → 关了 → 被重开 → 作废 → 同一张单复活）。
 
 ## API 一览
 
@@ -336,6 +370,13 @@ python3 tests/test_core.py       # 或 make unit —— 纯逻辑单测，无需
 | `POST /postings` | 下游申报某一笔已入账的版本 `{"subscriber_name" 或 "subscriber_id", "window_start", "key", "version"}`；报一个没送到的版本（从没发出，或还扣着未投）返回 `409`，这次申报不算数（但留痕） |
 | `GET /postings?subscriber=&key=&window_start=&status=` | 下游入账台账：每个下游每一笔它报到哪一版、我送到哪一版、对齐/落后/超前未确认、是否正被扣留（`gated`） |
 | `GET /postings/history?subscriber=&window_start=&key=` | 台账流水（只增）：每次申报（含被拒）与每次被新投递打成落后的前后状态——能查何时从对齐变落后、是哪一版打的 |
+| `POST /reconciliations` | 开对账批次：`{"subscriber_name" 或 "subscriber_id", "from_window_start", "to_window_start", "operator"?}`，事件时间区间自动吸附窗口；同下游两个 OPEN 批次区间重叠返回 `409`；响应带四类计数与冻结快照 |
+| `GET /reconciliations?subscriber=&subscriber_id=&status=` | 批次列表（倒序）：四类计数、认/驳数、未决条数 |
+| `GET /reconciliations/{id}` | 单个批次状态（`unresolved_items=0` 才可结） |
+| `GET /reconciliations/{id}/items?item_status=&decision=&undecided_only=&key=&window_start=` | 批次条目：冻结快照 + `live_*` 当下状态 + `drifted` |
+| `POST /reconciliations/{id}/decisions` | 认/驳一条非对齐条目：`{"window_start", "key", "decision": "CONFIRMED"|"REJECTED", "operator"?, "note"?}`；ALIGNED 行、CLOSED 批次返回 `409` |
+| `POST /reconciliations/{id}/close` | 结账：有未决条目 `409`；结掉后认驳冻结；重复结账幂等 |
+| `GET /reconciliations/{id}/events` | 批次只增流水：开账 / 逐条认驳（含旧裁决）/ 结账，时间正序 |
 | `GET /healthz` | 健康检查 |
 
 ## 配置

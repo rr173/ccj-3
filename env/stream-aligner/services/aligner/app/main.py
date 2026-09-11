@@ -59,6 +59,23 @@ traced); rollback reports move the ledger back without erasing delivery
 records. Every report and every delivery advance appends an immutable event,
 so the moment and the version that flipped a pair from aligned to lagging is
 always queryable.
+
+Reconciliation batches (对账批次) sit on top of the delivery outbox and the
+posting ledger: a batch is opened for ONE downstream over ONE event-time range
+and, at opening, takes a single transactional photograph — under the
+subscriber row lock, so it is one consistent state — of every result the
+downstream has any delivery row for: which version we sent / confirmed /
+still have in flight, which version it reported, the full per-version
+delivery ladder and any reports of ours it had rejected. Those snapshot
+columns are frozen forever; later ledger movement is visible only as separate
+live_* columns beside them. Each photographed pair is bucketed ALIGNED,
+LAGGING, AHEAD_UNCONFIRMED or NOT_REPORTED (sent but never reported);
+ALIGNED rows need no action while every other row must be adjudicated
+one by one — CONFIRMED (认账) or REJECTED (驳) — before the batch can close,
+and a verdict never moves the ledger or the outbox. Two OPEN batches of the
+same subscriber cannot cover overlapping windows; after closing, verdicts
+are frozen too, and a new batch may reopen the same range and photograph the
+then-current state.
 """
 import json
 import logging
@@ -78,9 +95,10 @@ from pydantic import BaseModel, Field
 from app.core import (ORDER_STATUSES, POSTING_STATUSES, build_order_snapshot,
                       compute_payload, decide, delivery_kind, evaluate_order,
                       normalize_backfill_range, order_reason, posting_status,
-                      released_version_kind, reportable_delivery_status,
-                      retry_delay_ms, should_deliver, side_evidence, window_of,
-                      window_ready)
+                      ranges_overlap, reconciliation_can_close,
+                      reconciliation_item_status, released_version_kind,
+                      reportable_delivery_status, retry_delay_ms, should_deliver,
+                      side_evidence, window_of, window_ready)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -401,6 +419,89 @@ CREATE INDEX IF NOT EXISTS posting_events_pair_idx
     ON posting_events (subscriber_id, window_start, key, id);
 CREATE INDEX IF NOT EXISTS posting_events_subscriber_idx
     ON posting_events (subscriber_id, id);
+-- ---------------------------------------------------------------------------
+-- Reconciliation batches (对账批次), per subscriber over a window range.
+--
+-- Opening a batch takes ONE transactional point-in-time photograph, under the
+-- subscriber row lock, of every result the downstream has any delivery row
+-- for in range: sent/delivered/in-flight versions, its last reported version,
+-- the full per-version delivery ladder and any reports of ours that were
+-- rejected (posting_events REPORT_REJECTED). Those columns are the frozen
+-- snapshot — later ledger/delivery movement never updates them; item rows are
+-- only ever touched by a CONFIRMED/REJECTED adjudication before close, and
+-- not even after. Every adjudication, the opening and the close append an
+-- immutable reconciliation_events row.
+--
+-- At most one OPEN batch per subscriber may cover any given window at a time
+-- (checked in create_reconciliation under the same subscriber row lock, so
+-- two concurrent opens cannot both miss the check). CLOSED batches never
+-- block a new batch, even over the exact same range.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS reconciliation_batches (
+    id                    BIGSERIAL PRIMARY KEY,
+    subscriber_id         BIGINT NOT NULL REFERENCES subscribers(id),
+    window_start_from     BIGINT NOT NULL,   -- snapped, inclusive
+    window_start_to       BIGINT NOT NULL,   -- snapped, exclusive
+    status                TEXT NOT NULL DEFAULT 'OPEN'
+                          CHECK (status IN ('OPEN', 'CLOSED')),
+    total_items           INT NOT NULL DEFAULT 0,
+    aligned_items         INT NOT NULL DEFAULT 0,
+    lagging_items         INT NOT NULL DEFAULT 0,
+    ahead_items           INT NOT NULL DEFAULT 0,
+    not_reported_items    INT NOT NULL DEFAULT 0,
+    confirmed_items       INT NOT NULL DEFAULT 0,
+    rejected_items        INT NOT NULL DEFAULT 0,
+    created_by            TEXT,
+    closed_by             TEXT,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    closed_at             TIMESTAMPTZ,
+    CHECK (window_start_from <= window_start_to)
+);
+CREATE INDEX IF NOT EXISTS reconciliation_batches_subscriber_idx
+    ON reconciliation_batches (subscriber_id, id DESC);
+CREATE INDEX IF NOT EXISTS reconciliation_batches_open_idx
+    ON reconciliation_batches (subscriber_id, window_start_from, window_start_to)
+    WHERE status = 'OPEN';
+CREATE TABLE IF NOT EXISTS reconciliation_items (
+    batch_id          BIGINT NOT NULL REFERENCES reconciliation_batches(id),
+    window_start      BIGINT NOT NULL,
+    key               TEXT NOT NULL,
+    window_end        BIGINT NOT NULL,
+    -- Frozen snapshot as of batch opening (never updated afterwards):
+    sent_version      INT NOT NULL,        -- highest delivery row of any status
+    delivered_version INT,                 -- highest DELIVERED (NULL = none)
+    inflight_version  INT,                 -- lowest non-DELIVERED (NULL = none)
+    reported_version  INT,                 -- downstream's last reported posting
+    item_status       TEXT NOT NULL CHECK (item_status IN
+                       ('ALIGNED', 'LAGGING', 'AHEAD_UNCONFIRMED', 'NOT_REPORTED')),
+    delivery_ladder   JSONB NOT NULL,      -- [{version, kind, status, channel}]
+    rejected_reports  JSONB NOT NULL,      -- posting-events REPORT_REJECTED rows
+    -- The only mutable columns: the adjudication, and only while the batch is
+    -- OPEN. ALIGNED rows never carry one ("对上的不用管").
+    decision          TEXT CHECK (decision IN ('CONFIRMED', 'REJECTED')),
+    decided_by        TEXT,
+    decided_at        TIMESTAMPTZ,
+    PRIMARY KEY (batch_id, window_start, key)
+);
+CREATE INDEX IF NOT EXISTS reconciliation_items_status_idx
+    ON reconciliation_items (batch_id, item_status);
+CREATE TABLE IF NOT EXISTS reconciliation_events (
+    id            BIGSERIAL PRIMARY KEY,
+    batch_id      BIGINT NOT NULL REFERENCES reconciliation_batches(id),
+    event         TEXT NOT NULL CHECK (event IN
+                   ('BATCH_OPENED', 'ITEM_DECIDED', 'BATCH_CLOSED')),
+    window_start  BIGINT,
+    key           TEXT,
+    item_status   TEXT,
+    decision      TEXT,
+    prev_decision TEXT,
+    operator      TEXT,
+    note          TEXT,
+    detail        JSONB,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS reconciliation_events_batch_idx
+    ON reconciliation_events (batch_id, id);
 """
 
 
@@ -1426,6 +1527,349 @@ def report_posting(conn, subscriber_id, window_start, key, version):
         return {"subscriber_id": subscriber_id, "window_start": window_start,
                 "key": key, "reported_version": version,
                 "delivered_up_to": delivered, "status": status}
+
+
+# ---------------------------------------------------------------------------
+# reconciliation batches (对账批次)
+# ---------------------------------------------------------------------------
+# A batch is opened for one subscriber over one event-time range. Opening takes
+# a single transactional photograph, under the subscriber row lock, of every
+# result that has any delivery row for that subscriber in range: the snapshot
+# columns on reconciliation_items (sent / delivered / in-flight / reported
+# versions, the full delivery ladder, the downstream's rejected reports) are
+# written once and never updated — later ledger or outbox movement lives only
+# in the query-layer "live_*" columns, never overwrites the photograph.
+#
+# Every non-aligned item must be adjudicated one by one (CONFIRMED/REJECTED)
+# before the batch can close; adjudication only writes the verdict columns and
+# an append-only event — it never touches the posting ledger or the outbox.
+# Closing is idempotent; once CLOSED the verdict columns are frozen too.
+
+# Per-result snapshot aggregates, plus the version ladder and the downstream's
+# rejected reports (the posting_events trail) frozen at opening time. All
+# reads run in the caller's single transaction, which holds the subscriber row
+# lock taken in create_reconciliation, so the photograph is one consistent
+# state — a delivery cannot land between the ladder read and the ledger read.
+RECON_SNAPSHOT_SQL = """
+WITH sent AS (
+    SELECT d.window_start, d.key, MAX(d.window_end) AS window_end,
+           MAX(d.version) AS sent_version,
+           MAX(d.version) FILTER (WHERE d.status = 'DELIVERED') AS delivered_version,
+           MIN(d.version) FILTER (WHERE d.status <> 'DELIVERED') AS inflight_version
+    FROM deliveries d
+    WHERE d.subscriber_id = %s
+      AND d.window_start >= %s AND d.window_start < %s
+    GROUP BY d.window_start, d.key
+),
+ladder AS (
+    SELECT d.window_start, d.key,
+           jsonb_agg(jsonb_build_object(
+                        'version', d.version, 'kind', d.kind,
+                        'status', d.status, 'channel', d.channel,
+                        'attempts', d.attempts, 'last_error', d.last_error,
+                        'delivered_at', d.delivered_at)
+                    ORDER BY d.version) AS delivery_ladder
+    FROM deliveries d
+    WHERE d.subscriber_id = %s
+      AND d.window_start >= %s AND d.window_start < %s
+    GROUP BY d.window_start, d.key
+),
+rej AS (
+    SELECT e.window_start, e.key,
+           jsonb_agg(jsonb_build_object(
+                        'version', e.cause_version, 'detail', e.detail,
+                        'created_at', e.created_at)
+                    ORDER BY e.id) AS rejected_reports
+    FROM posting_events e
+    WHERE e.subscriber_id = %s AND e.event = 'REPORT_REJECTED'
+      AND e.window_start >= %s AND e.window_start < %s
+    GROUP BY e.window_start, e.key
+)
+SELECT s.window_start, s.key, s.window_end, s.sent_version,
+       s.delivered_version, s.inflight_version, pl.reported_version,
+       l.delivery_ladder, COALESCE(r.rejected_reports, '[]'::jsonb) AS rejected_reports
+FROM sent s
+JOIN ladder l ON l.window_start = s.window_start AND l.key = s.key
+LEFT JOIN posting_ledger pl
+  ON pl.subscriber_id = %s AND pl.window_start = s.window_start AND pl.key = s.key
+LEFT JOIN rej r ON r.window_start = s.window_start AND r.key = s.key
+ORDER BY s.window_start, s.key
+"""
+
+
+def create_reconciliation(conn, subscriber_id, from_ms, to_ms, created_by=None):
+    """Open one reconciliation batch and materialize its immutable snapshot.
+
+    The event-time range is snapped to tumbling-window boundaries exactly
+    like backfill (normalize_backfill_range). Materialization, the overlap
+    guard and the BATCH_OPENED event commit in one transaction that first
+    locks the subscriber row — two concurrent opens for the same downstream
+    serialize here and cannot both pass the overlap check. Only an OPEN batch
+    blocks: a CLOSED batch over the same range never stops a new one.
+    """
+    from_ws, to_ws = normalize_backfill_range(from_ms, to_ms, WINDOW_MS)
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id, name, url, active FROM subscribers WHERE id = %s FOR UPDATE",
+            (subscriber_id,),
+        )
+        subscriber = cur.fetchone()
+        if subscriber is None:
+            raise HTTPException(404, "no such subscriber")
+        cur.execute(
+            """SELECT id, window_start_from, window_start_to
+               FROM reconciliation_batches
+               WHERE subscriber_id = %s AND status = 'OPEN'
+               FOR UPDATE""",
+            (subscriber_id,),
+        )
+        for row in cur.fetchall():
+            if ranges_overlap(from_ws, to_ws,
+                              row["window_start_from"], row["window_start_to"]):
+                raise HTTPException(
+                    409,
+                    f"open reconciliation batch {row['id']} for this subscriber already "
+                    f"covers [{row['window_start_from']}, {row['window_start_to']}), which "
+                    f"overlaps the requested [{from_ws}, {to_ws}); close it first")
+        cur.execute(
+            """INSERT INTO reconciliation_batches
+                   (subscriber_id, window_start_from, window_start_to, created_by)
+               VALUES (%s, %s, %s, %s) RETURNING *""",
+            (subscriber_id, from_ws, to_ws, created_by),
+        )
+        batch = cur.fetchone()
+        cur.execute(RECON_SNAPSHOT_SQL,
+                    (subscriber_id, from_ws, to_ws) * 3 + (subscriber_id,))
+        items = cur.fetchall()
+        counts = {s: 0 for s in ("ALIGNED", "LAGGING",
+                                 "AHEAD_UNCONFIRMED", "NOT_REPORTED")}
+        for r in items:
+            item_status = reconciliation_item_status(
+                r["sent_version"], r["delivered_version"],
+                r["inflight_version"], r["reported_version"])
+            counts[item_status] += 1
+            cur.execute(
+                """INSERT INTO reconciliation_items
+                       (batch_id, window_start, key, window_end, sent_version,
+                        delivered_version, inflight_version, reported_version,
+                        item_status, delivery_ladder, rejected_reports)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (batch["id"], r["window_start"], r["key"], r["window_end"],
+                 r["sent_version"], r["delivered_version"], r["inflight_version"],
+                 r["reported_version"], item_status,
+                 psycopg2.extras.Json(r["delivery_ladder"]),
+                 psycopg2.extras.Json(r["rejected_reports"])),
+            )
+        cur.execute(
+            """UPDATE reconciliation_batches
+               SET total_items = %s, aligned_items = %s, lagging_items = %s,
+                   ahead_items = %s, not_reported_items = %s
+               WHERE id = %s RETURNING *""",
+            (len(items), counts["ALIGNED"], counts["LAGGING"],
+             counts["AHEAD_UNCONFIRMED"], counts["NOT_REPORTED"], batch["id"]),
+        )
+        batch = cur.fetchone()
+        cur.execute(
+            """INSERT INTO reconciliation_events (batch_id, event, operator, detail)
+               VALUES (%s, 'BATCH_OPENED', %s, %s)""",
+            (batch["id"], created_by,
+             psycopg2.extras.Json({"window_start_from": from_ws,
+                                   "window_start_to": to_ws,
+                                   "total_items": len(items), **counts})),
+        )
+        # Snapshot rows as persisted — the immutable photograph the response
+        # hands back, status classification included.
+        cur.execute(
+            """SELECT * FROM reconciliation_items WHERE batch_id = %s
+               ORDER BY window_start, key""",
+            (batch["id"],),
+        )
+        snapshot = cur.fetchall()
+    log.info("reconciliation batch %s opened for subscriber=%s range=[%s,%s): %d items "
+             "(aligned=%d lagging=%d ahead=%d not_reported=%d)",
+             batch["id"], subscriber["name"], from_ws, to_ws, len(items),
+             counts["ALIGNED"], counts["LAGGING"], counts["AHEAD_UNCONFIRMED"],
+             counts["NOT_REPORTED"])
+    return batch, snapshot
+
+
+def get_reconciliation(cur, batch_id, for_update=False):
+    cur.execute(
+        f"""SELECT b.*, s.name AS subscriber, s.url,
+                   b.total_items - b.aligned_items
+                       - b.confirmed_items - b.rejected_items AS unresolved_items
+            FROM reconciliation_batches b
+            JOIN subscribers s ON s.id = b.subscriber_id
+            WHERE b.id = %s{' FOR UPDATE' if for_update else ''}""",
+        (batch_id,),
+    )
+    return cur.fetchone()
+
+
+def set_reconciliation_decision(conn, batch_id, window_start, key, decision,
+                                operator=None, note=None):
+    """Adjudicate one non-aligned item: CONFIRMED (认账) or REJECTED (驳).
+
+    Allowed only while the batch is OPEN; an ALIGNED item is never adjudicated
+    ("对上的不用管"). A different verdict re-decides the item (every change is
+    an event); the same verdict is an idempotent no-op. The batch counters are
+    recomputed from the items table in the same transaction.
+    """
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT status FROM reconciliation_batches WHERE id = %s FOR UPDATE",
+                    (batch_id,))
+        batch = cur.fetchone()
+        if batch is None:
+            raise HTTPException(404, "no such reconciliation batch")
+        if batch["status"] != "OPEN":
+            raise HTTPException(
+                409,
+                f"reconciliation batch {batch_id} is CLOSED — verdicts can no longer "
+                "be recorded or changed (结掉之后认驳不能再改)")
+        cur.execute(
+            """SELECT item_status, decision FROM reconciliation_items
+               WHERE batch_id = %s AND window_start = %s AND key = %s FOR UPDATE""",
+            (batch_id, window_start, key),
+        )
+        item = cur.fetchone()
+        if item is None:
+            raise HTTPException(404, "no such item in this reconciliation batch")
+        if item["item_status"] == "ALIGNED":
+            raise HTTPException(
+                409,
+                f"({window_start}, {key!r}) was ALIGNED at batch opening — aligned items "
+                "need no adjudication (对上的不用管)")
+        prev_decision = item["decision"]
+        if prev_decision != decision:
+            cur.execute(
+                """UPDATE reconciliation_items
+                   SET decision = %s, decided_by = %s, decided_at = now()
+                   WHERE batch_id = %s AND window_start = %s AND key = %s""",
+                (decision, operator, batch_id, window_start, key),
+            )
+            cur.execute(
+                """UPDATE reconciliation_batches b SET
+                       confirmed_items = (SELECT count(*) FROM reconciliation_items i
+                                          WHERE i.batch_id = b.id AND i.decision = 'CONFIRMED'),
+                       rejected_items  = (SELECT count(*) FROM reconciliation_items i
+                                          WHERE i.batch_id = b.id AND i.decision = 'REJECTED')
+                   WHERE b.id = %s""",
+                (batch_id,),
+            )
+            cur.execute(
+                """INSERT INTO reconciliation_events
+                       (batch_id, event, window_start, key, item_status,
+                        decision, prev_decision, operator, note)
+                   VALUES (%s, 'ITEM_DECIDED', %s, %s, %s, %s, %s, %s, %s)""",
+                (batch_id, window_start, key, item["item_status"], decision,
+                 prev_decision, operator, note),
+            )
+        batch = get_reconciliation(cur, batch_id)
+        cur.execute(
+            """SELECT * FROM reconciliation_items
+               WHERE batch_id = %s AND window_start = %s AND key = %s""",
+            (batch_id, window_start, key),
+        )
+        updated_item = cur.fetchone()
+    return batch, updated_item
+
+
+def close_reconciliation(conn, batch_id, operator=None):
+    """Close a batch once every non-aligned item carries a verdict.
+
+    Fails 409 while any LAGGING / AHEAD_UNCONFIRMED / NOT_REPORTED item is
+    still undecided — one undecided row keeps the whole batch open. Closing an
+    already-closed batch is an idempotent no-op (its frozen verdicts are
+    returned unchanged, no extra event is written).
+    """
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM reconciliation_batches WHERE id = %s FOR UPDATE",
+                    (batch_id,))
+        batch = cur.fetchone()
+        if batch is None:
+            raise HTTPException(404, "no such reconciliation batch")
+        if batch["status"] == "CLOSED":
+            return get_reconciliation(cur, batch_id)
+        cur.execute(
+            """SELECT window_start, key, item_status, decision
+               FROM reconciliation_items WHERE batch_id = %s FOR UPDATE""",
+            (batch_id,),
+        )
+        items = cur.fetchall()
+        unresolved = [
+            (r["window_start"], r["key"], r["item_status"])
+            for r in items
+            if r["item_status"] != "ALIGNED" and r["decision"] is None
+        ]
+        if unresolved:
+            raise HTTPException(
+                409,
+                f"reconciliation batch {batch_id} still has {len(unresolved)} undecided "
+                f"non-aligned item(s): every LAGGING / AHEAD_UNCONFIRMED / NOT_REPORTED "
+                "row must be CONFIRMED or REJECTED before closing "
+                "(有一条没处理完这批不能结)")
+        cur.execute(
+            """UPDATE reconciliation_batches
+               SET status = 'CLOSED', closed_at = now(), closed_by = %s
+               WHERE id = %s RETURNING *""",
+            (operator, batch_id),
+        )
+        cur.execute(
+            """INSERT INTO reconciliation_events (batch_id, event, operator, detail)
+               VALUES (%s, 'BATCH_CLOSED', %s, %s)""",
+            (batch_id, operator,
+             psycopg2.extras.Json({"total_items": batch["total_items"],
+                                   "confirmed_items": batch["confirmed_items"],
+                                   "rejected_items": batch["rejected_items"]})),
+        )
+        closed = get_reconciliation(cur, batch_id)
+    log.info("reconciliation batch %s closed by %s (%d items)",
+             batch_id, operator, batch["total_items"])
+    return closed
+
+
+# Live (post-opening) state shown next to the frozen snapshot in item queries.
+# Correlated subqueries read the outbox/ledger as they stand NOW; they never
+# write back to reconciliation_items, so the photograph cannot be retaken.
+RECON_ITEMS_SQL = """
+SELECT i.*, b.subscriber_id, s.name AS subscriber,
+       (SELECT max(d.version) FROM deliveries d
+         WHERE d.subscriber_id = b.subscriber_id
+           AND d.window_start = i.window_start AND d.key = i.key) AS live_sent_version,
+       (SELECT max(d.version) FILTER (WHERE d.status = 'DELIVERED') FROM deliveries d
+         WHERE d.subscriber_id = b.subscriber_id
+           AND d.window_start = i.window_start AND d.key = i.key) AS live_delivered_version,
+       (SELECT min(d.version) FILTER (WHERE d.status <> 'DELIVERED') FROM deliveries d
+         WHERE d.subscriber_id = b.subscriber_id
+           AND d.window_start = i.window_start AND d.key = i.key) AS live_inflight_version,
+       pl.reported_version AS live_reported_version
+FROM reconciliation_items i
+JOIN reconciliation_batches b ON b.id = i.batch_id
+JOIN subscribers s ON s.id = b.subscriber_id
+LEFT JOIN posting_ledger pl
+  ON pl.subscriber_id = b.subscriber_id
+ AND pl.window_start = i.window_start AND pl.key = i.key
+WHERE i.batch_id = %s
+{conds}
+ORDER BY i.window_start, i.key
+LIMIT %s
+"""
+
+
+def reconcile_item_live(row):
+    """Annotate a persisted item row with the live state beside its frozen
+    snapshot: the live four-bucket classification and whether either the raw
+    versions or the bucket moved since opening."""
+    live_status = reconciliation_item_status(
+        row["live_sent_version"], row["live_delivered_version"],
+        row["live_inflight_version"], row["live_reported_version"])
+    frozen = (row["sent_version"], row["delivered_version"],
+              row["inflight_version"], row["reported_version"])
+    live = (row["live_sent_version"], row["live_delivered_version"],
+            row["live_inflight_version"], row["live_reported_version"])
+    row["live_item_status"] = live_status
+    row["drifted"] = frozen != live
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -2584,3 +3028,252 @@ def posting_history(subscriber: Optional[str] = None,
     finally:
         conn.close()
     return {"events": rows}
+
+
+# ---------------------------------------------------------------------------
+# reconciliation batches (对账批次)
+# ---------------------------------------------------------------------------
+
+class ReconciliationIn(BaseModel):
+    subscriber_id: Optional[int] = None
+    subscriber_name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    from_window_start: int = Field(
+        ge=0,
+        description="event-time lower bound (inclusive); snapped DOWN to the "
+                    "start of the window containing it")
+    to_window_start: int = Field(
+        ge=0,
+        description="event-time upper bound (exclusive); snapped UP to the end "
+                    "of the last window it reaches into")
+    operator: Optional[str] = Field(default=None, max_length=200)
+
+
+class ReconciliationDecisionIn(BaseModel):
+    window_start: int = Field(ge=0)
+    key: str = Field(min_length=1, max_length=200)
+    decision: str = Field(description="CONFIRMED = 认账, REJECTED = 驳")
+    operator: Optional[str] = Field(default=None, max_length=200)
+    note: Optional[str] = Field(default=None, max_length=2000)
+
+
+class ReconciliationCloseIn(BaseModel):
+    operator: Optional[str] = Field(default=None, max_length=200)
+
+
+def resolve_subscriber(cur, subscriber_id=None, subscriber_name=None):
+    """Resolve the subscriber id from the id/name pair, validating that
+    exactly one was given. Raises 404/422 like the posting/backfill paths."""
+    if (subscriber_id is None) == (subscriber_name is None):
+        raise HTTPException(422, "provide exactly one of subscriber_id or subscriber_name")
+    if subscriber_id is not None:
+        cur.execute("SELECT id FROM subscribers WHERE id = %s", (subscriber_id,))
+    else:
+        cur.execute("SELECT id FROM subscribers WHERE name = %s", (subscriber_name,))
+    row = cur.fetchone()
+    if row is None:
+        raise HTTPException(404, "no such subscriber")
+    return row["id"]
+
+
+@app.post("/reconciliations", status_code=201)
+def reconciliation_open(body: ReconciliationIn):
+    """Open a reconciliation batch for one downstream over an event-time range.
+
+    At opening, every result the downstream has a delivery row for in range is
+    photographed once — sent / delivered / in-flight / reported versions, the
+    per-version delivery ladder and the downstream's rejected reports. That
+    photograph is immutable: later posting-ledger or outbox movement never
+    rewrites it (item queries additionally show the live state beside it). The
+    range is snapped to window boundaries the same way backfill ranges are.
+    Two OPEN batches of the same subscriber may not cover overlapping windows
+    (409); a CLOSED batch never blocks a new one.
+    """
+    if body.to_window_start <= body.from_window_start:
+        raise HTTPException(422, "to_window_start must be greater than from_window_start")
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            subscriber_id = resolve_subscriber(
+                cur, body.subscriber_id, body.subscriber_name)
+        try:
+            batch, items = create_reconciliation(
+                conn, subscriber_id, body.from_window_start,
+                body.to_window_start, body.operator)
+        except psycopg2.errors.UniqueViolation:
+            raise HTTPException(409, "a conflicting reconciliation batch already exists")
+    finally:
+        conn.close()
+    return {"reconciliation": batch, "items": items}
+
+
+@app.get("/reconciliations")
+def reconciliation_list(subscriber_id: Optional[int] = None,
+                        subscriber: Optional[str] = None,
+                        status: Optional[str] = None,
+                        limit: int = Query(default=100)):
+    """Reconciliation batches, newest first, with item/verdict/unresolved counts."""
+    if status is not None and status not in ("OPEN", "CLOSED"):
+        raise HTTPException(422, "status must be OPEN or CLOSED")
+    sql = """
+    SELECT b.*, s.name AS subscriber, s.url,
+           b.total_items - b.aligned_items
+               - b.confirmed_items - b.rejected_items AS unresolved_items
+    FROM reconciliation_batches b
+    JOIN subscribers s ON s.id = b.subscriber_id"""
+    conds, args = [], []
+    if subscriber_id is not None:
+        conds.append("b.subscriber_id = %s")
+        args.append(subscriber_id)
+    if subscriber is not None:
+        conds.append("s.name = %s")
+        args.append(subscriber)
+    if status is not None:
+        conds.append("b.status = %s")
+        args.append(status)
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY b.id DESC LIMIT %s"
+    args.append(min(max(limit, 1), 1000))
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, args)
+            batches = cur.fetchall()
+    finally:
+        conn.close()
+    return {"reconciliations": batches}
+
+
+@app.get("/reconciliations/{batch_id}")
+def reconciliation_get(batch_id: int):
+    """One batch with counts; ``unresolved_items`` is the number of non-aligned
+    rows still missing a verdict — 0 means the batch is closeable."""
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            batch = get_reconciliation(cur, batch_id)
+    finally:
+        conn.close()
+    if batch is None:
+        raise HTTPException(404, "no such reconciliation batch")
+    return {"reconciliation": batch}
+
+
+@app.get("/reconciliations/{batch_id}/items")
+def reconciliation_items(batch_id: int, key: Optional[str] = None,
+                         window_start: Optional[int] = None,
+                         item_status: Optional[str] = None,
+                         decision: Optional[str] = None,
+                         undecided_only: bool = False,
+                         limit: int = Query(default=500)):
+    """The batch's frozen per-result photographs.
+
+    Each row carries the immutable snapshot as of opening plus live_* columns
+    computed from the current outbox/ledger — ``drifted`` marks rows whose
+    state moved since the photograph was taken; nothing live ever rewrites the
+    snapshot. Filters: key / window_start / item_status (ALIGNED, LAGGING,
+    AHEAD_UNCONFIRMED, NOT_REPORTED) / decision (CONFIRMED, REJECTED) /
+    undecided_only (non-aligned rows without a verdict — what still blocks
+    closing).
+    """
+    if item_status is not None and item_status not in (
+            "ALIGNED", "LAGGING", "AHEAD_UNCONFIRMED", "NOT_REPORTED"):
+        raise HTTPException(422,
+                            "item_status must be ALIGNED, LAGGING, "
+                            "AHEAD_UNCONFIRMED or NOT_REPORTED")
+    if decision is not None and decision not in ("CONFIRMED", "REJECTED"):
+        raise HTTPException(422, "decision must be CONFIRMED or REJECTED")
+    conds, args = [], []
+    if key is not None:
+        conds.append("i.key = %s")
+        args.append(key)
+    if window_start is not None:
+        conds.append("i.window_start = %s")
+        args.append(window_start)
+    if item_status is not None:
+        conds.append("i.item_status = %s")
+        args.append(item_status)
+    if decision is not None:
+        conds.append("i.decision = %s")
+        args.append(decision)
+    if undecided_only:
+        conds.append("i.item_status <> 'ALIGNED' AND i.decision IS NULL")
+    sql = RECON_ITEMS_SQL.format(conds=(" WHERE " + " AND ".join(conds)) if conds else "")
+    args.append(min(max(limit, 1), 5000))
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT status FROM reconciliation_batches WHERE id = %s",
+                (batch_id,))
+            exists = cur.fetchone()
+            if exists is None:
+                raise HTTPException(404, "no such reconciliation batch")
+            cur.execute(sql, [batch_id] + args)
+            rows = [reconcile_item_live(r) for r in cur.fetchall()]
+            batch_status = exists["status"]
+    finally:
+        conn.close()
+    return {"batch_id": batch_id, "status": batch_status, "items": rows}
+
+
+@app.post("/reconciliations/{batch_id}/decisions")
+def reconciliation_decide(batch_id: int, body: ReconciliationDecisionIn):
+    """Adjudicate one non-aligned item: CONFIRMED (认账) or REJECTED (驳).
+
+    Only an OPEN batch accepts verdicts; after closing both recording and
+    changing a verdict return 409 (结掉之后认驳不能再改). ALIGNED items cannot
+    be adjudicated (对上的不用管). Re-deciding with a different verdict while
+    still open is allowed and every change is traced; the same verdict is an
+    idempotent no-op. A verdict never moves the posting ledger or the outbox —
+    it is the reconciliation outcome for that frozen row only.
+    """
+    if body.decision not in ("CONFIRMED", "REJECTED"):
+        raise HTTPException(422, "decision must be CONFIRMED or REJECTED")
+    conn = connect()
+    try:
+        batch, item = set_reconciliation_decision(
+            conn, batch_id, body.window_start, body.key, body.decision,
+            body.operator, body.note)
+    finally:
+        conn.close()
+    return {"reconciliation": batch, "item": item}
+
+
+@app.post("/reconciliations/{batch_id}/close")
+def reconciliation_close(batch_id: int, body: ReconciliationCloseIn = None):
+    """Close a batch.
+
+    Every LAGGING / AHEAD_UNCONFIRMED / NOT_REPORTED item must carry a verdict
+    first — a single undecided row keeps the batch OPEN (409). ALIGNED rows
+    never need one. Closing an already-closed batch is an idempotent no-op.
+    """
+    operator = body.operator if body is not None else None
+    conn = connect()
+    try:
+        batch = close_reconciliation(conn, batch_id, operator)
+    finally:
+        conn.close()
+    return {"reconciliation": batch}
+
+
+@app.get("/reconciliations/{batch_id}/events")
+def reconciliation_events(batch_id: int, limit: int = Query(default=1000)):
+    """The batch's append-only trail, chronological: BATCH_OPENED, every
+    ITEM_DECIDED (with the previous verdict) and BATCH_CLOSED."""
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id FROM reconciliation_batches WHERE id = %s", (batch_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(404, "no such reconciliation batch")
+            cur.execute(
+                """SELECT * FROM reconciliation_events
+                   WHERE batch_id = %s ORDER BY id LIMIT %s""",
+                (batch_id, min(max(limit, 1), 5000)),
+            )
+            events = cur.fetchall()
+    finally:
+        conn.close()
+    return {"batch_id": batch_id, "events": events}

@@ -262,6 +262,82 @@ def reportable_delivery_status(delivery_status):
 
 
 # ---------------------------------------------------------------------------
+# Reconciliation batches (对账批次)
+#
+# A batch is a point-in-time reconciliation for ONE downstream over ONE
+# event-time range of windows. At opening, every result that has any delivery
+# row for that downstream in range is snapshotted once: which version we sent
+# up to, which is confirmed delivered, which is still on the wire (PENDING /
+# RETRYING), and which version the downstream reported posted. Later ledger
+# movement never rewrites the snapshot — the batch answers "what did the books
+# say at opening", and the query layer can additionally show the live state
+# next to it.
+#
+# Each snapshot falls into exactly one of four buckets:
+# - ALIGNED           — it reports exactly the version we confirmed delivered;
+# - LAGGING           — it reports an older version than we delivered;
+# - AHEAD_UNCONFIRMED — it reports a version we have not confirmed delivered
+#                       (still retrying / held — possibly genuinely posted);
+# - NOT_REPORTED      — we sent versions but it never reported this result.
+#
+# ALIGNED rows need no action; every other row must be adjudicated one by one
+# (CONFIRMED = 认账 / REJECTED = 驳) before the batch can close. The decision
+# is a reconciliation verdict, not a ledger write — it never moves the posting
+# ledger or the outbox. Once the batch is CLOSED its decisions are frozen.
+# ---------------------------------------------------------------------------
+
+RECON_ITEM_STATUSES = ("ALIGNED", "LAGGING", "AHEAD_UNCONFIRMED", "NOT_REPORTED")
+RECON_DECISIONS = ("CONFIRMED", "REJECTED")
+RECON_BATCH_STATUSES = ("OPEN", "CLOSED")
+
+
+def reconciliation_item_status(sent_version, delivered_version,
+                               inflight_version, reported_version):
+    """Classify one snapshotted (downstream, result) pair at batch opening.
+
+    ``sent_version``      — highest version with a delivery row of any status
+                            (PENDING / RETRYING / DELIVERED); never None, since
+                            an item exists only because at least one row exists;
+    ``delivered_version`` — highest version confirmed DELIVERED (None = none);
+    ``inflight_version``  — lowest version not yet DELIVERED (None = all sent
+                            versions are confirmed delivered);
+    ``reported_version``  — version the downstream last reported posted
+                            (None = it never reported this result).
+
+    The ordering mirrors the live posting ledger (``posting_status``), with
+    one extra bucket: no report at all is NOT_REPORTED rather than an empty
+    ledger row.
+    """
+    if reported_version is None:
+        return "NOT_REPORTED"
+    if delivered_version is None or reported_version > delivered_version:
+        return "AHEAD_UNCONFIRMED"
+    if reported_version < delivered_version:
+        return "LAGGING"
+    return "ALIGNED"
+
+
+def reconciliation_item_unresolved(item_status, decision):
+    """Whether a batch item still needs adjudication before the batch can
+    close. ALIGNED rows are settled by definition; every other row is open
+    until someone records a CONFIRMED/REJECTED decision on it."""
+    return item_status != "ALIGNED" and decision is None
+
+
+def reconciliation_can_close(items):
+    """True iff every item is settled: each is either ALIGNED at snapshot time
+    or carries an adjudication. ``items`` is an iterable of
+    ``(item_status, decision)`` pairs."""
+    return all(not reconciliation_item_unresolved(status, decision)
+               for status, decision in items)
+
+
+def ranges_overlap(from_a, to_a, from_b, to_b):
+    """Half-open interval overlap: [from_a, to_a) vs [from_b, to_b)."""
+    return from_a < to_b and from_b < to_a
+
+
+# ---------------------------------------------------------------------------
 # Per-key emission gate (按业务键分开关窗).
 #
 # A result for (window, key) is emitted only when *that key's own two sides*

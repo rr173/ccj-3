@@ -218,6 +218,66 @@ curl -sf "$R/postings/history?subscriber=demo-sink&window_start=$WS&key=order-1"
   | field "[(e['event'], e['cause_version'], e['prev_status'], e['status']) for e in d['events']]"
 
 # ---------------------------------------------------------------------------
+# reconciliation batches: a point-in-time photograph per downstream × range,
+# adjudicated one non-aligned row at a time, then frozen on close
+# ---------------------------------------------------------------------------
+say "10e. reconciliation batch: snapshot, per-row 认/驳, close-and-freeze"
+RKEY="order-recon"
+post "$A/events" '{"event_id":"rc-a1","event_time":'"$((WS+1000))"',"key":"'"$RKEY"'","payload":{"n":1}}' >/dev/null
+post "$B/events" '{"events":[
+  {"event_id":"rc-b1","event_time":'"$((WS+1500))"',"key":"'"$RKEY"'","payload":{"n":1}},
+  {"event_id":"rc-hb","event_time":'"$PUSH"',"key":"__hb__"}]}' >/dev/null
+post "$A/events" '{"event_id":"rc-hb","event_time":'"$PUSH"',"key":"__hb__"}' >/dev/null
+wait_version "$WS" "$RKEY" 1
+post "$R/releases" '{"key":"'"$RKEY"'"}' >/dev/null
+sleep 2
+echo "sink reports v1 -> ALIGNED, then a v2 CORRECTION is delivered -> LAGGING:"
+post "$R/postings" "{\"subscriber_name\":\"demo-sink\",\"window_start\":$WS,\"key\":\"$RKEY\",\"version\":1}" | field "d['posting']['status']"
+post "$B/events" '{"event_id":"rc-b2","event_time":'"$((WS+600))"',"key":"'"$RKEY"'","payload":{"n":2}}' >/dev/null
+wait_version "$WS" "$RKEY" 2
+sleep 2
+curl -sf "$R/postings?subscriber=demo-sink&key=$RKEY" \
+  | field "[(p['reported_version'], p['delivered_up_to'], p['status']) for p in d['postings']]"
+RBID=$(post "$R/reconciliations" "{\"subscriber_name\":\"demo-sink\",\"from_window_start\":$WS,\"to_window_start\":$((WS+WINDOW_MS)),\"operator\":\"demo\"}" \
+  | tee /tmp/rc-open.json | field "d['reconciliation']['id']")
+echo "opened batch $RBID over the demo window (mid-window bounds snap the same way):"
+cat /tmp/rc-open.json | field "{'id': d['reconciliation']['id'], 'status': d['reconciliation']['status'], 'counts': {'total': d['reconciliation']['total_items'], 'aligned': d['reconciliation']['aligned_items'], 'lagging': d['reconciliation']['lagging_items'], 'not_reported': d['reconciliation']['not_reported_items']}, 'unresolved': d['reconciliation']['unresolved_items']}"
+echo "items as of opening — frozen sent/delivered/reported per (window, key):"
+curl -sf "$R/reconciliations/$RBID/items" \
+  | field "[(i['key'], i['item_status'], i['sent_version'], i['delivered_version'], i['reported_version']) for i in d['items']]"
+echo "ledger keeps moving AFTER opening (sink catches the recon key up to v2) — the snapshot must NOT change:"
+post "$R/postings" "{\"subscriber_name\":\"demo-sink\",\"window_start\":$WS,\"key\":\"$RKEY\",\"version\":2}" >/dev/null
+sleep 1
+curl -sf "$R/reconciliations/$RBID/items?key=$RKEY" \
+  | field "[{'frozen': (i['item_status'], i['reported_version']), 'live': (i['live_item_status'], i['live_reported_version']), 'drifted': i['drifted']} for i in d['items']]"
+echo "aligned rows cannot be adjudicated (对上的不用管); undecided rows block closing:"
+curl -s -o /dev/null -w '  verdict on an ALIGNED row -> http %{http_code}\n' -X POST "$R/reconciliations/$RBID/decisions" \
+  -H 'Content-Type: application/json' \
+  -d "{\"window_start\":$WS,\"key\":\"order-1\",\"decision\":\"CONFIRMED\"}"
+curl -s -o /dev/null -w '  close with undecided rows -> http %{http_code}\n' -X POST "$R/reconciliations/$RBID/close" \
+  -H 'Content-Type: application/json' -d '{"operator":"demo"}'
+echo "every non-aligned row is 认 (CONFIRMED) or 驳 (REJECTED), one by one:"
+curl -sf "$R/reconciliations/$RBID/items?undecided_only=true" \
+  | python3 -c "import sys,json; [print(str(i['window_start'])+'\t'+i['key']) for i in json.load(sys.stdin)['items']]" \
+  | while IFS=$'\t' read -r RWS RK; do
+      echo "  adjudicate $RK @ $RWS -> CONFIRMED"
+      post "$R/reconciliations/$RBID/decisions" \
+        "{\"window_start\":$RWS,\"key\":\"$RK\",\"decision\":\"CONFIRMED\",\"operator\":\"demo\",\"note\":\"demo 认账\"}" \
+        | field "{'key': d['item']['key'], 'decision': d['item']['decision'], 'unresolved': d['reconciliation']['unresolved_items']}"
+    done
+post "$R/reconciliations/$RBID/close" '{"operator":"demo"}' \
+  | field "{'id': d['reconciliation']['id'], 'status': d['reconciliation']['status'], 'closed_by': d['reconciliation']['closed_by']}"
+echo "closed: verdicts are frozen (认驳不能再改) and the same range can be reopened:"
+curl -s -o /dev/null -w '  change verdict after close -> http %{http_code}\n' -X POST "$R/reconciliations/$RBID/decisions" \
+  -H 'Content-Type: application/json' \
+  -d "{\"window_start\":$WS,\"key\":\"$RKEY\",\"decision\":\"REJECTED\"}"
+post "$R/reconciliations" "{\"subscriber_name\":\"demo-sink\",\"from_window_start\":$WS,\"to_window_start\":$((WS+WINDOW_MS)),\"operator\":\"demo\"}" \
+  | field "{'new_batch': d['reconciliation']['id'], 'status': d['reconciliation']['status'], 'items': [(i['key'], i['item_status']) for i in d['items'][:3]]}"
+echo "the batch trail (open / every decision / close):"
+curl -sf "$R/reconciliations/$RBID/events" \
+  | field "[(e['event'], e.get('key'), e.get('decision'), e.get('prev_decision')) for e in d['events']]"
+
+# ---------------------------------------------------------------------------
 # business orders: one business key spanning two windows, full lifecycle
 # ---------------------------------------------------------------------------
 say "11. business orders: one key across two windows (open -> waiting -> closed)"
