@@ -24,12 +24,14 @@ test:          ## e2e test against a running stack
 	python3 tests/test_posting_e2e.py
 	python3 tests/test_recon_e2e.py
 	python3 tests/test_settlement_e2e.py
+	python3 tests/test_carry_e2e.py
 
 unit:          ## dependency-free unit tests of the alignment core
 	python3 tests/test_core.py
 	python3 tests/test_order_core.py
 	python3 tests/test_recon_core.py
 	python3 tests/test_settlement_core.py
+	python3 tests/test_carry_core.py
 
 psql:          ## open psql on the aligner database
 	$(COMPOSE) exec postgres psql -U postgres -d aligner

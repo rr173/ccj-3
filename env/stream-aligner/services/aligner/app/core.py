@@ -595,10 +595,11 @@ def grace_fate(status, deadline_ms, now_ms, has_effective_data):
 ORDER_STATUSES = ("OPEN", "WAITING", "CLOSED", "REOPENED", "VOID")
 
 ORDER_REASONS = ("ORDER_OPENED", "WINDOW_JOINED", "WINDOW_CORRECTED",
-                 "WINDOW_WITHDRAWN", "WINDOW_REVIVED")
+                 "WINDOW_WITHDRAWN", "WINDOW_REVIVED", "CARRY_RESOLVED")
 
 
-def evaluate_order(bindings, missing, pending, ever_closed, reason):
+def evaluate_order(bindings, missing, pending, ever_closed, reason,
+                   open_carry_count=0):
     """Decide an order's status from its current window bindings.
 
     ``bindings``    — one dict per bound window: {"result_status", "has_gap"}.
@@ -607,21 +608,27 @@ def evaluate_order(bindings, missing, pending, ever_closed, reason):
     ``pending``     — business windows known from events but not yet due.
     ``ever_closed`` — the order has reached CLOSED at least once before.
     ``reason``      — what the triggering result version did to its window.
+    ``open_carry_count`` — non-terminal gap carries (OPEN / REOPENED) still
+                      moving events between this key's windows: the order is
+                      not fully resolved while any exists ("结转还没对上" is
+                      a waiting state, not a success), so CLOSE is blocked.
 
     CLOSE requires all of: at least one live window; every known business
     window bound (nothing missing or pending); no withdrawn window left
-    unresolved; no live window still waiting for the opposite side. All
-    windows withdrawn -> VOID (the business is gone, not a success).
+    unresolved; no live window still waiting for the opposite side; no
+    still-open carry. All windows withdrawn -> VOID (the business is gone, not
+    a success).
 
     A correction or withdrawal NEVER (re)closes an order that has been closed
     before: the close is invalidated and stays invalidated — the order shows
     REOPENED, never "still closed", no matter how well the data matches after
     the correction. Only genuine new business can close it again: a new
-    window joining (WINDOW_JOINED) or a withdrawn window reviving
-    (WINDOW_REVIVED), evaluated against the close conditions. Anything else
-    short of CLOSE is OPEN while windows are still being collected and
-    WAITING once only one-sided gaps remain — labelled REOPENED instead once
-    the order has been closed before.
+    window joining (WINDOW_JOINED), a withdrawn window reviving
+    (WINDOW_REVIVED) or a carry finally closing (CARRY_RESOLVED), evaluated
+    against the close conditions. Anything else short of CLOSE is OPEN while
+    windows are still being collected and WAITING once only one-sided gaps
+    (or in-flight carries) remain — labelled REOPENED instead once the order
+    has been closed before.
     """
     live = [b for b in bindings if b["result_status"] == "CURRENT"]
     if not live:
@@ -630,7 +637,7 @@ def evaluate_order(bindings, missing, pending, ever_closed, reason):
         return "REOPENED"
     if missing or pending or any(b["result_status"] == "RETRACTED" for b in bindings):
         return "REOPENED" if ever_closed else "OPEN"
-    if any(b["has_gap"] for b in live):
+    if any(b["has_gap"] for b in live) or carry_open_block_order(open_carry_count):
         return "REOPENED" if ever_closed else "WAITING"
     return "CLOSED"
 
@@ -651,6 +658,216 @@ def order_reason(prev_status, new_status):
     return "WINDOW_CORRECTED"
 
 
+# ---------------------------------------------------------------------------
+# Gap carry-forwards (缺口结转).
+#
+# A closed window whose one side came out longer can carry its leftover events
+# to a LATER window of the SAME business key, before that later window has
+# produced any result. Carried events are injected into the target's longer
+# side and paired against the target's own leftovers; any pair involving a
+# carried event is visibly a carry pair (it carries the carry id and the source
+# window — never written as a native pair of the target window).
+#
+# A carry has a lifecycle:
+#   OPEN      created, none (or only part) of its events have matched yet;
+#   CLOSED    every carried event matched in the target — a frozen
+#             matched_snapshot preserves "当时对上的样子";
+#   REOPENED  a CLOSED carry whose match was later undone (the target window
+#             corrected/withdrew, or got its own longer-side events so the
+#             carried event is leftover again) — it must never keep showing
+#             CLOSED;
+#   VOID      dead forever: one of its events was retracted at the source or
+#             got paired at the source by a late opposite-side event. A void
+#             carry can never match again, and (together with the global
+#             per-event history in gap_carry_items) its events can never be
+#             carried a second time — "结转出去的那几条，原来那一窗不能再拿去
+#             结第二次", "作废的不能再拿去对".
+#
+# The same unmatched event therefore cannot sit in two OPEN carries either:
+# event identity is unique across the whole carry-items history, a database
+# constraint backstopped by create_carry's checks.
+# ---------------------------------------------------------------------------
+
+CARRY_STATUSES = ("OPEN", "CLOSED", "REOPENED", "VOID")
+CARRY_SIDES = ("a", "b")
+# Item-level match state. CARRIED = still waiting at the target; MATCHED = the
+# target paired it; DEAD = the carry was voided for this item (retracted at the
+# source, or paired at the source by a late event).
+CARRY_ITEM_STATUSES = ("CARRIED", "MATCHED", "DEAD")
+# Why a carry died. source_retracted = a carried event was retracted;
+# source_paired = a late opposite-side event paired it at the source window.
+CARRY_VOID_REASONS = ("source_retracted", "source_paired")
+
+
+def opposite_side(side):
+    return "b" if side == "a" else "a"
+
+
+def annotate_source_payload(payload, side, carry_id, item_event_ids):
+    """Move a source window's just-carried leftover events out of its
+    ``unmatched_<side>`` list into the payload's ``carried`` bookkeeping.
+
+    The source window's own result is corrected in the same logical operation
+    that opens the carry: the events are no longer "waiting for the opposite
+    side in THIS window" — they are en route to another window. Carried events
+    never disappear from the source history, they are just visibly routed. The
+    annotation is idempotent: a replay of the same carry never moves an event
+    twice, and an event already annotated for a different carry is left alone
+    (the create path rejects double-carries before this is ever called).
+    """
+    if payload is None:
+        return None
+    ids = list(item_event_ids)
+    key = f"unmatched_{side}"
+    carried = dict(payload.get("carried") or {})
+    existing = set(carried.get(side, []))
+    to_move = [e for e in payload.get(key, []) if e in ids and e not in existing]
+    if not to_move:
+        return payload
+    new_payload = dict(payload)
+    new_payload[key] = [e for e in payload.get(key, []) if e not in to_move]
+    new_payload["carried"] = {
+        **carried,
+        side: sorted(existing | set(to_move)),
+    }
+    return new_payload
+
+
+def compute_payload_with_carries(key, window_start, window_end,
+                                 a_upserts, b_upserts, carries):
+    """Compute a target window's result with live carry events routed in.
+
+    ``carries`` is a list of {"id", "side", "source_window_start", "events":
+    [{"event_id", "event_time", "payload"}]} for every non-VOID carry aimed at
+    this window (VOID carries are excluded by the caller).
+
+    Two pairing pools, in strict order:
+
+    1. NATIVE pairing - the target window's own events pair exactly as in
+       compute_payload (sorted by (event_time, event_id), positionally). A
+       routed-in event can NEVER displace one of these pairs, no matter where
+       its event_time sorts: the carry was routed to fill the target's gap, not
+       to rearrange the target's own business.
+    2. CARRY pairing - each carried event then pairs against the target's own
+       leftover on the opposite side (the gap this carry was opened for). Two
+       carried events never pair each other (routed leftovers from two windows
+       closing against each other would prove nothing about the target). When
+       several carries compete for one leftover, the OLDEST carry wins
+       (carry id, then event_time, event_id) - deterministic FIFO.
+
+    Every carry pair is tagged {"carry_id", "source_window_start"}, so the
+    result can never present a carry match as the target window's own native
+    pair. Unpaired carried events stay OUT of unmatched_* (they are not the
+    target's events - they remain CARRIED on their carry, which is how a
+    partially matched carry stays OPEN); the target's own leftovers it did not
+    pair stay in unmatched_* and may themselves be carried onward later.
+    """
+    a_native = sorted(a_upserts, key=lambda e: (e["event_time"], e["event_id"]))
+    b_native = sorted(b_upserts, key=lambda e: (e["event_time"], e["event_id"]))
+    if not a_native and not b_native and not carries:
+        return None
+
+    # 1) native pairing pool (unchanged from compute_payload)
+    n = min(len(a_native), len(b_native))
+    pairs = [
+        {
+            "a_event_id": a_native[i]["event_id"],
+            "b_event_id": b_native[i]["event_id"],
+            "a_payload": a_native[i].get("payload"),
+            "b_payload": b_native[i].get("payload"),
+            "carry": None,
+        }
+        for i in range(n)
+    ]
+    a_left = list(a_native[n:])   # target's own A leftovers
+    b_left = list(b_native[n:])   # target's own B leftovers
+
+    # 2) carry pairing pool - only against the target's own opposite leftovers.
+    queued = {"a": [], "b": []}
+    for c in sorted(carries, key=lambda c: c["id"]):
+        tag = {"carry_id": c["id"], "source_window_start": c["source_window_start"]}
+        for e in sorted(c["events"], key=lambda e: (e["event_time"], e["event_id"])):
+            queued[c["side"]].append((e, tag))
+    queued["a"].sort(key=lambda t: (t[1]["carry_id"], t[0]["event_time"], t[0]["event_id"]))
+    queued["b"].sort(key=lambda t: (t[1]["carry_id"], t[0]["event_time"], t[0]["event_id"]))
+
+    carry_pairs = []
+    for ea, tag in queued["a"]:
+        if b_left:
+            eb = b_left.pop(0)  # native leftovers are already (time,id)-sorted
+            carry_pairs.append((ea, eb, tag))
+    for eb, tag in queued["b"]:
+        if a_left:
+            ea = a_left.pop(0)
+            carry_pairs.append((ea, eb, tag))
+
+    for ea, eb, tag in carry_pairs:
+        pairs.append({
+            "a_event_id": ea["event_id"], "b_event_id": eb["event_id"],
+            "a_payload": ea.get("payload"), "b_payload": eb.get("payload"),
+            "carry": tag,
+        })
+    return {
+        "key": key,
+        "window_start": window_start,
+        "window_end": window_end,
+        "match_count": len(pairs) - len(carry_pairs),
+        "carry_match_count": len(carry_pairs),
+        "pairs": pairs,
+        "unmatched_a": [e["event_id"] for e in a_left],
+        "unmatched_b": [e["event_id"] for e in b_left],
+        "carried": {},
+    }
+
+
+def carry_matched_event_ids(payload, carry_id):
+    """The set of THIS carry's events the target payload currently pairs.
+    Recomputed from the payload on every derivation, so a CLOSED carry is
+    reopened automatically when a later target version stops pairing one of
+    its events ("已经关上的必须重开，不能还显示对上了")."""
+    if payload is None:
+        return set()
+    ids = set()
+    for p in payload.get("pairs", []):
+        tag = p.get("carry")
+        if tag and tag.get("carry_id") == carry_id:
+            ids.add(p["a_event_id"])
+            ids.add(p["b_event_id"])
+    return ids
+
+
+def carry_item_fate(item_event_id, item_side, native_payload, live_event_ids):
+    """Fate of one carried event against the SOURCE window's recomputation.
+
+    Returns None while the event is still a valid leftover of the source
+    (eligible to keep riding the carry), otherwise a machine-readable death:
+
+    - ``source_retracted`` — the event is no longer an effective (non-retracted)
+      event at all;
+    - ``source_paired``    — a late opposite-side event paired it at the source
+      window, so routing it elsewhere would double-count it.
+
+    ``live_event_ids`` is the set of currently effective event ids of its
+    stream in the source window; ``native_payload`` is the source's ordinary
+    (carry-free) recomputation.
+    """
+    if item_event_id not in live_event_ids:
+        return "source_retracted"
+    unmatched = set(native_payload.get(f"unmatched_{item_side}", [])) if native_payload else set()
+    if item_event_id not in unmatched:
+        # live but no longer a leftover on its side: it got paired at source
+        # (or, defensibly, consumed some other way — either way it cannot be
+        # routed to another window anymore).
+        return "source_paired"
+    return None
+
+
+def carry_open_block_order(open_count):
+    """An order cannot reach CLOSED while one of its keys' carries is still
+    open/reopened (events are in flight between two windows)."""
+    return bool(open_count)
+
+
 def build_order_snapshot(bindings):
     """Deterministic full-order snapshot: every window and the result version
     it is bound to, ordered by window. Stored on each order version so the
@@ -665,6 +882,8 @@ def build_order_snapshot(bindings):
             "match_count": b["match_count"],
             "unmatched_a": b["unmatched_a"],
             "unmatched_b": b["unmatched_b"],
+            "carried_a": b.get("carried_a", []),
+            "carried_b": b.get("carried_b", []),
             "payload_hash": b["payload_hash"],
         }
         for b in sorted(bindings, key=lambda b: b["window_start"])

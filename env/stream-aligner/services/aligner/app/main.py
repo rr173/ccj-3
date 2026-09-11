@@ -107,6 +107,25 @@ AHEAD_UNCONFIRMED item CONFIRMED marks its retrying version DELIVERED at
 close and aligns the ledger. Two OPEN batches of the same subscriber cannot
 cover overlapping windows; after closing, verdicts are frozen too, and a new
 batch may reopen the same range and photograph the then-current state.
+
+Gap carry-forwards (缺口结转) route one side's unmatched leftovers of a CLOSED
+source window to one LATER, not-yet-emitted window of the SAME business key:
+POST /gap-carries. The source window is corrected in the same logical
+operation (reason CARRY_FORWARD) so its events visibly leave its own gap
+(payload carried-a/carried-b); when the target window later emits, carried
+events pair only against the target's own opposite-side leftovers, and every
+such pair is tagged {carry_id, source_window_start} (a carry match is never
+written as the target window's own native pair; native pairs are formed from
+the native pool first and are never displaced by a routed event). Carries are
+OPEN while any event is still unpaired (partial matches record per-item
+MATCHED rows), CLOSED once everything pairs with an immutable matched_snapshot
+("当时对上的样子"), and REOPENED or VOID after a later source/target correction:
+a carried event retracted or paired at the source voids the carry (dead
+forever — its events can never be carried again or match anywhere; the global
+unique index on gap_carry_items also enforces "one event rides at most one
+carry, ever"), while a target correction/withdrawal reopens a closed carry the
+same tick. A carry can only target an unemitted window; different keys can
+never share one.
 """
 import json
 import logging
@@ -125,8 +144,11 @@ from pydantic import BaseModel, Field
 
 from app.core import (MAX_GRACE_EXTRA_MS, ORDER_STATUSES, POSTING_STATUSES,
                       build_order_snapshot,
-                      compute_payload, decide, delivery_kind, evaluate_order,
-                      grace_grant_error, normalize_backfill_range, order_reason,
+                      annotate_source_payload,
+                      compute_payload, compute_payload_with_carries,
+                      carry_item_fate, decide,
+                      delivery_kind, evaluate_order, grace_grant_error,
+                      normalize_backfill_range, opposite_side, order_reason,
                       posting_status, ranges_overlap, reconciliation_can_close,
                       reconciliation_item_status, released_version_kind,
                       retry_delay_ms, settlement_blocks_report, settlement_effect,
@@ -194,7 +216,7 @@ CREATE TABLE IF NOT EXISTS results (
     payload      JSONB,
     payload_hash TEXT,
     status       TEXT NOT NULL CHECK (status IN ('CURRENT', 'SUPERSEDED', 'RETRACTED')),
-    reason       TEXT NOT NULL CHECK (reason IN ('INITIAL', 'LATE_EVENT', 'RETRACTION')),
+    reason       TEXT NOT NULL CHECK (reason IN ('INITIAL', 'LATE_EVENT', 'RETRACTION', 'CARRY_FORWARD')),
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (window_start, key, version)
 );
@@ -644,6 +666,118 @@ CREATE INDEX IF NOT EXISTS window_graces_active_due_idx
     ON window_graces (due_at) WHERE status = 'ACTIVE';
 CREATE INDEX IF NOT EXISTS window_graces_key_idx
     ON window_graces (key, window_start);
+-- ---------------------------------------------------------------------------
+-- Gap carry-forwards (缺口结转).
+--
+-- One carry routes the leftover events of ONE side of a CLOSED source window
+-- to one LATER, not-yet-emitted window of the SAME business key, where they
+-- are injected into the carry side's ordering and paired against the target's
+-- own leftovers. Lifecycle:
+--   OPEN     created, none/part of the events matched yet;
+--   CLOSED   every event matched at the target — matched_snapshot freezes
+--            "当时对上的样子" (which target version paired each event);
+--   REOPENED a CLOSED carry whose target later corrected/withdrew so a pair
+--            no longer exists — never keeps showing CLOSED; the carry waits
+--            (and re-matches) like OPEN;
+--   VOID     dead forever: an event was retracted at the source or got paired
+--            at the source by a late opposite-side event. A void carry can
+--            never match again.
+--
+-- gap_carry_events is the append-only trail (open / item match / close /
+-- reopen / void). The global UNIQUE(key, side, event_id) on gap_carry_items
+-- is the hard form of two rules at once: "结转出去的那几条，原来那一窗不能
+-- 再拿去结第二次" (a void carry's events stay in history and cannot be carried
+-- again) and "同一条对不上的不能同时待在两张还开着的结转里" (one event rides
+-- at most one carry, period). A carry can only target an unemitted window —
+-- enforced by create_carry under the key's gate-row lock, the same lock every
+-- emit() takes, so an INITIAL result racing the grant cannot slip past it.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS gap_carries (
+    id                    BIGSERIAL PRIMARY KEY,
+    key                   TEXT NOT NULL,
+    side                  TEXT NOT NULL CHECK (side IN ('a', 'b')),
+    source_window_start   BIGINT NOT NULL,
+    source_window_end     BIGINT NOT NULL,
+    target_window_start   BIGINT NOT NULL,
+    target_window_end     BIGINT NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'OPEN'
+                          CHECK (status IN ('OPEN', 'CLOSED', 'REOPENED', 'VOID')),
+    source_version        INT NOT NULL,   -- source result version at creation
+    target_version        INT,            -- target version that closed the carry
+    matched_snapshot      JSONB,          -- frozen close-time match picture
+    void_reason           TEXT CHECK (void_reason IN ('source_retracted', 'source_paired')),
+    created_by            TEXT,
+    note                  TEXT,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    closed_at             TIMESTAMPTZ,
+    reopened_at           TIMESTAMPTZ,
+    voided_at             TIMESTAMPTZ,
+    CHECK (target_window_start > source_window_start)
+);
+CREATE INDEX IF NOT EXISTS gap_carries_key_idx ON gap_carries (key, id);
+CREATE INDEX IF NOT EXISTS gap_carries_target_idx
+    ON gap_carries (target_window_start, key) WHERE status <> 'VOID';
+CREATE INDEX IF NOT EXISTS gap_carries_source_idx
+    ON gap_carries (source_window_start, key);
+CREATE INDEX IF NOT EXISTS gap_carries_open_idx
+    ON gap_carries (key) WHERE status IN ('OPEN', 'REOPENED');
+CREATE TABLE IF NOT EXISTS gap_carry_items (
+    carry_id      BIGINT NOT NULL REFERENCES gap_carries(id),
+    key           TEXT NOT NULL,
+    side          TEXT NOT NULL CHECK (side IN ('a', 'b')),
+    event_id      TEXT NOT NULL,
+    event_time    BIGINT NOT NULL,
+    payload       JSONB,
+    item_status   TEXT NOT NULL DEFAULT 'CARRIED'
+                  CHECK (item_status IN ('CARRIED', 'MATCHED', 'DEAD')),
+    matched_version    INT,             -- target result version that paired it
+    matched_against    TEXT,            -- the opposite-side event it paired with
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (carry_id, event_id)
+);
+-- One event rides at most one carry across the whole history: this rejects a
+-- second carry whether the first one is OPEN, CLOSED, REOPENED or VOID
+-- ("作废的不能再拿去对", "原来那一窗不能再拿去结第二次").
+CREATE UNIQUE INDEX IF NOT EXISTS gap_carry_items_event_uq
+    ON gap_carry_items (key, side, event_id);
+CREATE INDEX IF NOT EXISTS gap_carry_items_carry_idx
+    ON gap_carry_items (carry_id, item_status);
+CREATE TABLE IF NOT EXISTS gap_carry_events (
+    id               BIGSERIAL PRIMARY KEY,
+    carry_id         BIGINT NOT NULL REFERENCES gap_carries(id),
+    key              TEXT NOT NULL,
+    event            TEXT NOT NULL CHECK (event IN
+                     ('CARRY_OPENED', 'ITEM_MATCHED', 'CARRY_CLOSED',
+                      'CARRY_REOPENED', 'CARRY_VOIDED')),
+    target_version   INT,
+    detail           JSONB,
+    operator         TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS gap_carry_events_carry_idx
+    ON gap_carry_events (carry_id, id);
+CREATE INDEX IF NOT EXISTS gap_carry_events_key_idx
+    ON gap_carry_events (key, id);
+-- CARRY_FORWARD is the reason of every result version the carry machinery
+-- produces: the source window's "these leftovers are routed elsewhere"
+-- correction, and the target window's recomputation as carries open/close/
+-- void. It delivers to downstream as an ordinary CORRECTION.
+ALTER TABLE results DROP CONSTRAINT IF EXISTS results_reason_check;
+ALTER TABLE results ADD CONSTRAINT results_reason_check
+    CHECK (reason IN ('INITIAL', 'LATE_EVENT', 'RETRACTION', 'CARRY_FORWARD'));
+ALTER TABLE audit DROP CONSTRAINT IF EXISTS audit_reason_check;
+ALTER TABLE audit ADD CONSTRAINT audit_reason_check
+    CHECK (reason IN ('INITIAL', 'LATE_EVENT', 'RETRACTION', 'CARRY_FORWARD'));
+-- A carry finally closing (CARRY_RESOLVED) is genuine new progress that may
+-- close an order that was WAITING on the in-flight events.
+ALTER TABLE biz_order_versions DROP CONSTRAINT IF EXISTS biz_order_versions_reason_check;
+ALTER TABLE biz_order_versions ADD CONSTRAINT biz_order_versions_reason_check
+    CHECK (reason IN
+           ('ORDER_OPENED','WINDOW_JOINED','WINDOW_CORRECTED',
+            'WINDOW_WITHDRAWN','WINDOW_REVIVED','CARRY_RESOLVED'));
+-- Source windows record which leftovers are currently routed out, per side.
+ALTER TABLE biz_order_windows ADD COLUMN IF NOT EXISTS carried_a INT NOT NULL DEFAULT 0;
+ALTER TABLE biz_order_windows ADD COLUMN IF NOT EXISTS carried_b INT NOT NULL DEFAULT 0;
 """
 
 
@@ -687,8 +821,8 @@ def get_head(cur, window_start, key):
     return {"id": row[0], "version": row[1], "status": row[2], "payload_hash": row[3]} if row else None
 
 
-def build_payload(cur, window_start, key):
-    """Recompute the result for (window, key) from the stored events.
+def load_effective_events(cur, window_start, key):
+    """Effective (non-retracted) upserts of (window, key), per stream.
 
     Retractions are applied via NOT EXISTS over the whole stream, so a retract
     event landing in a *different* window still filters its target.
@@ -710,7 +844,76 @@ def build_payload(cur, window_start, key):
         by_stream[stream].append(
             {"event_id": event_id, "event_time": event_time, "payload": payload}
         )
-    return compute_payload(key, window_start, window_end, by_stream["a"], by_stream["b"])
+    return by_stream
+
+
+def carries_for_window(cur, window_start, key):
+    """All non-VOID carries aimed at (window, key), with their live item
+    events. Matched items MUST stay injected: a CLOSED carry's pair is part of
+    the target result, so an unrelated later correction of the target must not
+    silently drop the pair (that would reopen the carry every tick). Only
+    DEAD items (a voided carry) are excluded."""
+    cur.execute(
+        """SELECT c.id, c.side, c.source_window_start,
+                  i.event_id, i.event_time, i.payload
+           FROM gap_carries c
+           JOIN gap_carry_items i ON i.carry_id = c.id AND i.item_status <> 'DEAD'
+           WHERE c.key = %s AND c.target_window_start = %s
+             AND c.status IN ('OPEN', 'REOPENED', 'CLOSED')
+           ORDER BY c.id, i.event_time, i.event_id""",
+        (key, window_start),
+    )
+    carries = {}
+    for cid, side, source_ws, event_id, event_time, payload in cur.fetchall():
+        c = carries.setdefault(cid, {"id": cid, "side": side,
+                                     "source_window_start": source_ws, "events": []})
+        c["events"].append({"event_id": event_id, "event_time": event_time,
+                            "payload": payload})
+    return list(carries.values())
+
+
+def render_window_payload(cur, window_start, key, carries=None):
+    """The window's payload as it must be stored now: native events paired by
+    the ordinary rule, with live carries (if any) injected into their side and
+    every carry pair visibly tagged. ``carries`` is loaded by the caller when
+    needed; passing None/empty reproduces the pre-carry computation exactly."""
+    window_end = window_start + WINDOW_MS
+    by_stream = load_effective_events(cur, window_start, key)
+    if carries:
+        return compute_payload_with_carries(
+            key, window_start, window_end,
+            by_stream["a"], by_stream["b"], carries)
+    return compute_payload(key, window_start, window_end,
+                           by_stream["a"], by_stream["b"])
+
+
+def build_payload(cur, window_start, key):
+    """Recompute the plain (carry-free) result for (window, key)."""
+    return render_window_payload(cur, window_start, key)
+
+
+def outgoing_carries_for_window(cur, window_start, key):
+    """Live carries ROUTING OUT of (window, key): their non-DEAD items,
+    grouped per carry. A source window re-emitted after a correction keeps
+    showing every routed event as "carried" rather than as its own unmatched
+    gap — a MATCHED item still left through the carry, only a DEAD item (void
+    carry, event retracted / paired at the source) returns to the window.
+    CLOSED carries thus keep annotating the source; a VOID carry drops out, so
+    its surviving events return to unmatched."""
+    cur.execute(
+        """SELECT c.id, c.side, i.event_id
+           FROM gap_carries c
+           JOIN gap_carry_items i ON i.carry_id = c.id AND i.item_status <> 'DEAD'
+           WHERE c.key = %s AND c.source_window_start = %s
+             AND c.status <> 'VOID'
+           ORDER BY c.id, i.event_time, i.event_id""",
+        (key, window_start),
+    )
+    carries = {}
+    for cid, side, event_id in cur.fetchall():
+        carries.setdefault(cid, {"id": cid, "side": side, "event_ids": []})
+        carries[cid]["event_ids"].append(event_id)
+    return list(carries.values())
 
 
 def emit(conn, window_start, key, reason, detail, grace=None):
@@ -785,7 +988,14 @@ def emit(conn, window_start, key, reason, detail, grace=None):
                          window_start, key)
                 return False
 
-        payload = build_payload(cur, window_start, key)
+        payload = render_window_payload(
+            cur, window_start, key, carries_for_window(cur, window_start, key))
+        # Leftovers this window routed elsewhere stay visibly routed: they are
+        # not this window's own unmatched gap anymore. Applied AFTER the
+        # incoming-carries render so chained windows carry correctly.
+        for oc in outgoing_carries_for_window(cur, window_start, key):
+            payload = annotate_source_payload(
+                payload, oc["side"], oc["id"], oc["event_ids"])
         head = get_head(cur, window_start, key)
         nxt = decide(head, payload)
 
@@ -1175,6 +1385,62 @@ def order_window_gaps(cur, key, bound):
     return sorted(missing), sorted(pending)
 
 
+def fold_order(cur, key, reason, trigger_ws=None, trigger_result_version=None,
+               trigger_result_id=None):
+    """Recompute the key's order from its current bindings and append one
+    order version. Used by the result builder (trigger = the result version
+    just committed) and by gap-carry resolution (reason CARRY_RESOLVED,
+    trigger = the target result that closed a carry). Returns
+    (order_id, version, status) or None when the key has no order row yet.
+
+    The caller already holds the key's gate row lock; a non-advancing fold
+    (identical status and snapshot) writes nothing.
+    """
+    cur.execute("SELECT id, head_version, ever_closed FROM biz_orders WHERE key = %s",
+                (key,))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    order_id, head_version, ever_closed = row
+    cur.execute(
+        """SELECT window_start, window_end, result_version, result_status, has_gap,
+                  match_count, unmatched_a, unmatched_b, carried_a, carried_b,
+                  payload_hash
+           FROM biz_order_windows WHERE order_id = %s ORDER BY window_start""",
+        (order_id,),
+    )
+    cols = [d[0] for d in cur.description]
+    bindings = [dict(zip(cols, r)) for r in cur.fetchall()]
+    missing, pending = order_window_gaps(cur, key, {b["window_start"] for b in bindings})
+    cur.execute(
+        "SELECT count(*) FROM gap_carries WHERE key = %s AND status IN ('OPEN', 'REOPENED')",
+        (key,),
+    )
+    open_carries = cur.fetchone()[0]
+    status = evaluate_order(bindings, missing, pending, ever_closed, reason,
+                            open_carry_count=open_carries)
+    version = head_version + 1
+    cur.execute(
+        """INSERT INTO biz_order_versions
+               (order_id, version, status, reason, trigger_window_start,
+                trigger_result_version, trigger_result_id, snapshot,
+                missing_windows, pending_windows)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+        (order_id, version, status, reason, trigger_ws, trigger_result_version,
+         trigger_result_id,
+         psycopg2.extras.Json(build_order_snapshot(bindings)),
+         psycopg2.extras.Json(missing), psycopg2.extras.Json(pending)),
+    )
+    cur.execute(
+        """UPDATE biz_orders
+           SET status = %s, head_version = %s,
+               ever_closed = ever_closed OR %s, updated_at = now()
+           WHERE id = %s""",
+        (status, version, status == "CLOSED", order_id),
+    )
+    return order_id, version, status
+
+
 def apply_result_to_order(conn, result):
     """Fold one committed result version into its key's order.
 
@@ -1191,6 +1457,9 @@ def apply_result_to_order(conn, result):
     match_count = payload["match_count"] if payload else 0
     unmatched_a = len(payload["unmatched_a"]) if payload else 0
     unmatched_b = len(payload["unmatched_b"]) if payload else 0
+    carried = (payload or {}).get("carried") or {}
+    carried_a = len(carried.get("a", []))
+    carried_b = len(carried.get("b", []))
     with conn, conn.cursor() as cur:
         cur.execute(
             """INSERT INTO biz_orders (key, status, head_version)
@@ -1198,11 +1467,10 @@ def apply_result_to_order(conn, result):
             (key,),
         )
         cur.execute(
-            "SELECT id, head_version, ever_closed FROM biz_orders WHERE key = %s",
+            "SELECT head_version FROM biz_orders WHERE key = %s",
             (key,),
         )
-        order_id, head_version, ever_closed = cur.fetchone()
-
+        head_version = cur.fetchone()[0]
         cur.execute(
             "SELECT result_status FROM biz_order_windows WHERE key = %s AND window_start = %s",
             (key, ws),
@@ -1211,8 +1479,10 @@ def apply_result_to_order(conn, result):
         cur.execute(
             """INSERT INTO biz_order_windows
                    (order_id, key, window_start, window_end, result_version, result_status,
-                    has_gap, match_count, unmatched_a, unmatched_b, payload_hash)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    has_gap, match_count, unmatched_a, unmatched_b, carried_a, carried_b,
+                    payload_hash)
+               VALUES ((SELECT id FROM biz_orders WHERE key = %s), %s, %s, %s, %s, %s,
+                       %s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT (key, window_start) DO UPDATE SET
                    result_version = EXCLUDED.result_version,
                    result_status  = EXCLUDED.result_status,
@@ -1220,43 +1490,20 @@ def apply_result_to_order(conn, result):
                    match_count    = EXCLUDED.match_count,
                    unmatched_a    = EXCLUDED.unmatched_a,
                    unmatched_b    = EXCLUDED.unmatched_b,
+                   carried_a      = EXCLUDED.carried_a,
+                   carried_b      = EXCLUDED.carried_b,
                    payload_hash   = EXCLUDED.payload_hash,
                    updated_at     = now()""",
-            (order_id, key, ws, we, result["version"], result_status, has_gap,
-             match_count, unmatched_a, unmatched_b, result["payload_hash"]),
+            (key, key, ws, we, result["version"], result_status, has_gap,
+             match_count, unmatched_a, unmatched_b, carried_a, carried_b,
+             result["payload_hash"]),
         )
-        cur.execute(
-            """SELECT window_start, window_end, result_version, result_status, has_gap,
-                      match_count, unmatched_a, unmatched_b, payload_hash
-               FROM biz_order_windows WHERE order_id = %s ORDER BY window_start""",
-            (order_id,),
-        )
-        cols = [d[0] for d in cur.description]
-        bindings = [dict(zip(cols, row)) for row in cur.fetchall()]
-        missing, pending = order_window_gaps(cur, key, {b["window_start"] for b in bindings})
         reason = "ORDER_OPENED" if head_version == 0 else order_reason(
             prev[0] if prev else None, result_status)
-        status = evaluate_order(bindings, missing, pending, ever_closed, reason)
-        version = head_version + 1
-        cur.execute(
-            """INSERT INTO biz_order_versions
-                   (order_id, version, status, reason, trigger_window_start,
-                    trigger_result_version, trigger_result_id, snapshot,
-                    missing_windows, pending_windows)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-            (order_id, version, status, reason, ws, result["version"], result["id"],
-             psycopg2.extras.Json(build_order_snapshot(bindings)),
-             psycopg2.extras.Json(missing), psycopg2.extras.Json(pending)),
-        )
-        cur.execute(
-            """UPDATE biz_orders
-               SET status = %s, head_version = %s,
-                   ever_closed = ever_closed OR %s, updated_at = now()
-               WHERE id = %s""",
-            (status, version, status == "CLOSED", order_id),
-        )
+        folded = fold_order(cur, key, reason, ws, result["version"], result["id"])
         cur.execute("UPDATE biz_order_state SET last_result_id = %s WHERE id = 1",
                     (result["id"],))
+    _, version, status = folded
     log.info("order key=%s -> v%d (%s, %s) by window=%d result v%d",
              key, version, status, reason, ws, result["version"])
 
@@ -1280,12 +1527,516 @@ def build_orders(conn):
             return
 
 
+# ---------------------------------------------------------------------------
+# gap carry-forwards (缺口结转)
+# ---------------------------------------------------------------------------
+# A carry routes the leftover events of one side of a CLOSED source window to
+# a LATER, still-unemitted window of the SAME business key. The machinery below
+# enforces, all under the key's gate row lock (the same lock emit() takes, so
+# the "target not emitted yet" rule cannot be raced by a close on another
+# thread):
+#
+# - only live leftovers of the source's CURRENT head can be routed; one event
+#   rides at most one carry in the whole history (gap_carry_items' global unique
+#   index, so a VOID carry's events can never be carried a second time, and an
+#   event can never sit in two OPEN carries);
+# - the target is the same key, a later window boundary, and has produced no
+#   result yet ("只能接到还没出过结果的后面那一窗，已经出过的再接要失败");
+# - once a source or target correction/retraction touches a closed carry it is
+#   REOPENED (matched again on the next derivation) or VOID (a carried event
+#   was retracted / got paired at the source by a late event) — it never keeps
+#   showing CLOSED; void carries can never match again;
+# - target pairing is derived from the target's stored head payload: pairs
+#   tagged with the carry id are visibly carry pairs (never the target's own
+#   pair); all items matched closes the carry and freezes matched_snapshot
+#   ("对上了要关上，并留下当时对上的样子").
+
+def carry_event(cur, carry_id, key, event, target_version=None, detail=None):
+    cur.execute(
+        """INSERT INTO gap_carry_events (carry_id, key, event, target_version, detail)
+           VALUES (%s, %s, %s, %s, %s)""",
+        (carry_id, key, event, target_version,
+         psycopg2.extras.Json(detail) if detail is not None else None),
+    )
+
+
+def carry_row_dict(cur, carry_id):
+    cur.execute(
+        """SELECT c.*,
+                  (SELECT count(*) FROM gap_carry_items i WHERE i.carry_id = c.id)
+                      AS n_items,
+                  (SELECT count(*) FROM gap_carry_items i
+                    WHERE i.carry_id = c.id AND i.item_status = 'MATCHED')
+                      AS n_matched
+           FROM gap_carries c WHERE c.id = %s""",
+        (carry_id,),
+    )
+    return dict(zip([d[0] for d in cur.description], cur.fetchone()))
+
+
+def create_carry(conn, source_window_start, target_window_start, key, side,
+                 event_ids=None, operator=None, note=None):
+    """Open one gap carry from a closed source window's leftovers to a later,
+    not-yet-emitted window of the same key.
+
+    ``event_ids`` defaults to every CURRENT leftover of the carried side.
+    Raises HTTPException: 422 bad window boundary/order/side, 404 source has
+    no live head, 409 target already emitted / not later / event not a leftover
+    / event already on another carry (open, closed or void).
+    """
+    if side not in ("a", "b"):
+        raise HTTPException(422, "side must be 'a' or 'b'")
+    if not valid_window_start(source_window_start, WINDOW_MS):
+        raise HTTPException(422, f"source_window_start {source_window_start} is not a window boundary")
+    if not valid_window_start(target_window_start, WINDOW_MS):
+        raise HTTPException(422, f"target_window_start {target_window_start} is not a window boundary")
+    if target_window_start <= source_window_start:
+        raise HTTPException(422, "target_window_start must be a LATER window than the source")
+    with conn, conn.cursor() as cur:
+        # Same lock order as every other writer: key gate row first.
+        cur.execute(
+            "INSERT INTO release_gates (key) VALUES (%s) ON CONFLICT (key) DO NOTHING",
+            (key,),
+        )
+        cur.execute("SELECT 1 FROM release_gates WHERE key = %s FOR UPDATE", (key,))
+        cur.fetchone()
+
+        head = get_head(cur, source_window_start, key)
+        if head is None or head["status"] == "RETRACTED":
+            raise HTTPException(
+                404,
+                f"source window {source_window_start} of key {key!r} has no live result "
+                "to carry from")
+        native = render_window_payload(cur, source_window_start, key)
+        leftovers = set(native.get(f"unmatched_{side}", []))
+        if not leftovers:
+            raise HTTPException(
+                409,
+                f"source window {source_window_start} of key {key!r} has no leftover on "
+                f"side {side!r} to carry")
+        # The target must never have produced a result — not even a retracted
+        # one ("已经出过的再接要失败"); what went out (or briefly existed) is a
+        # fact, corrections are its only path, not an incoming carry.
+        target_head = get_head(cur, target_window_start, key)
+        if target_head is not None:
+            raise HTTPException(
+                409,
+                f"target window {target_window_start} of key {key!r} already produced "
+                f"result v{target_head['version']} — a carry can only target a window "
+                "that has not emitted yet (只能接到还没出过结果的后面那一窗)")
+        wanted = leftovers if event_ids is None else set(event_ids)
+        if not wanted:
+            raise HTTPException(422, "event_ids must be non-empty")
+        unknown = sorted(wanted - leftovers)
+        if unknown:
+            raise HTTPException(
+                409,
+                f"event(s) {unknown} are not a CURRENT unmatched_{side} leftover of "
+                f"source window {source_window_start} (already paired, retracted, or "
+                "already carried out)")
+        # Global history check — one event rides at most one carry, ever. The
+        # partial-less unique index on gap_carry_items is the hard backstop.
+        cur.execute(
+            """SELECT i.event_id, i.carry_id, c.status
+               FROM gap_carry_items i JOIN gap_carries c ON c.id = i.carry_id
+               WHERE i.key = %s AND i.side = %s AND i.event_id = ANY(%s)""",
+            (key, side, sorted(wanted)),
+        )
+        dupes = cur.fetchall()
+        if dupes:
+            detail = "; ".join(
+                f"{eid} already on carry {cid} ({st})" for eid, cid, st in dupes)
+            raise HTTPException(
+                409,
+                f"the same unmatched event cannot ride two carries — and a void "
+                f"carry's events can never be carried again: {detail}")
+
+        by_stream = load_effective_events(cur, source_window_start, key)
+        events = sorted((e for e in by_stream[side] if e["event_id"] in wanted),
+                        key=lambda e: (e["event_time"], e["event_id"]))
+        missing_events = sorted(wanted - {e["event_id"] for e in events})
+        if missing_events:
+            raise HTTPException(
+                409,
+                f"event(s) {missing_events} are not effective {side}-side events of "
+                f"source window {source_window_start} (retracted or from the other side)")
+        cur.execute(
+            """INSERT INTO gap_carries
+                   (key, side, source_window_start, source_window_end,
+                    target_window_start, target_window_end, source_version,
+                    created_by, note)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+            (key, side, source_window_start, source_window_start + WINDOW_MS,
+             target_window_start, target_window_start + WINDOW_MS,
+             head["version"], operator, note),
+        )
+        carry = dict(zip([d[0] for d in cur.description], cur.fetchone()))
+        cid = carry["id"]
+        for e in events:
+            cur.execute(
+                """INSERT INTO gap_carry_items
+                       (carry_id, key, side, event_id, event_time, payload)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (cid, key, side, e["event_id"], e["event_time"],
+                 psycopg2.extras.Json(e["payload"]) if e.get("payload") is not None else None),
+            )
+        carry_event(cur, cid, key, "CARRY_OPENED", detail={
+            "source_window_start": source_window_start,
+            "target_window_start": target_window_start,
+            "side": side,
+            "source_version": head["version"],
+            "events": [e["event_id"] for e in events],
+        }, )
+        carry = carry_row_dict(cur, cid)
+
+    # Same logical operation: the source window's result now shows those
+    # leftovers as routed out (a new audited result version). Separate
+    # transaction on purpose — if it fails, a later tick's emit reaches the
+    # same content via outgoing_carries_for_window, and the reverse split (carry
+    # row without the correction) self-heals the same way. emit() recomputes
+    # from the committed carry, so no annotation is passed in.
+    emitted = emit(conn, source_window_start, key, "CARRY_FORWARD", {
+        "carry_id": cid, "op": "opened",
+        "target_window_start": target_window_start, "side": side,
+        "events": [e["event_id"] for e in events],
+    })
+    log.info("gap carry %s opened: key=%s side=%s window %d -> %d events=%d (source re-emitted=%s)",
+             cid, key, side, source_window_start, target_window_start, len(events), emitted)
+    return carry
+
+
+def invalidate_dirty_carries(conn, dirty):
+    """Re-validate carries whose SOURCE window changed (late event /
+    retraction pulled in this tick), BEFORE the dirty windows are re-emitted.
+
+    A carried event that was retracted (source_retracted) or got paired at the
+    source by a late opposite-side event (source_paired) kills the carry
+    outright (VOID: dead forever, never matches again). A CLOSED carry whose
+    leftovers merely moved (hash drift without a dead item) is REOPENED here —
+    the closed match is a fact of the past version, but it must not keep
+    showing CLOSED against the new source; the next derivation closes it again
+    with a fresh snapshot if the target still pairs everything.
+
+    Returns the (key, target_window_start) set of carries voided this call, so
+    the caller can recompute their already-emitted targets in the same tick.
+    """
+    voided_targets = set()
+    by_key_ws = {}
+    for ws, key, reason, detail in dirty:
+        by_key_ws.setdefault((key, ws), reason)
+    if not by_key_ws:
+        return voided_targets
+    with conn, conn.cursor() as cur:
+        for (key, ws), reason in by_key_ws.items():
+            # Lock order matches every other writer: key gate row first,
+            # then that key's carry rows (create_carry holds the gate lock
+            # while inserting, so the reverse order would deadlock).
+            cur.execute(
+                "INSERT INTO release_gates (key) VALUES (%s) ON CONFLICT (key) DO NOTHING",
+                (key,),
+            )
+            cur.execute("SELECT 1 FROM release_gates WHERE key = %s FOR UPDATE", (key,))
+            cur.fetchone()
+            cur.execute(
+                """SELECT id, target_window_start FROM gap_carries
+                   WHERE key = %s AND source_window_start = %s
+                     AND status <> 'VOID'
+                   ORDER BY id FOR UPDATE""",
+                (key, ws),
+            )
+            carry_rows = cur.fetchall()
+            if not carry_rows:
+                continue
+            carry_ids = [r[0] for r in carry_rows]
+            targets = {cid: r[1] for cid, r in zip(carry_ids, carry_rows)}
+            native = render_window_payload(cur, ws, key)
+            by_stream = load_effective_events(cur, ws, key)
+            for cid in carry_ids:
+                cur.execute(
+                    "SELECT side, status FROM gap_carries WHERE id = %s FOR UPDATE",
+                    (cid,),
+                )
+                side, status = cur.fetchone()
+                live_ids = {e["event_id"] for e in by_stream[side]}
+                cur.execute(
+                    """SELECT event_id FROM gap_carry_items
+                       WHERE carry_id = %s AND item_status <> 'DEAD'
+                       ORDER BY event_id""",
+                    (cid,),
+                )
+                items = [r[0] for r in cur.fetchall()]
+                dead = {}
+                for eid in items:
+                    fate = carry_item_fate(eid, side, native, live_ids)
+                    if fate:
+                        dead[eid] = fate
+                if dead:
+                    cur.execute(
+                        """UPDATE gap_carry_items SET item_status = 'DEAD', updated_at = now()
+                           WHERE carry_id = %s AND event_id = ANY(%s)""",
+                        (cid, sorted(dead)),
+                    )
+                    # A mixed batch (some retracted, some source-paired) dies
+                    # with the retraction as the void reason — dead either way.
+                    reason0 = ("source_retracted"
+                               if "source_retracted" in dead.values()
+                               else "source_paired")
+                    cur.execute(
+                        """UPDATE gap_carries
+                           SET status = 'VOID', void_reason = %s, voided_at = now()
+                           WHERE id = %s""",
+                        (reason0, cid),
+                    )
+                    carry_event(cur, cid, key, "CARRY_VOIDED", detail={
+                        "reason": reason0, "dead_events": sorted(dead),
+                        "trigger": reason,
+                    })
+                    voided_targets.add((key, targets[cid]))
+                    log.info("gap carry %s VOID (%s: %s) by source window %d correction",
+                             cid, reason0, sorted(dead), ws)
+                    continue
+                if status == "CLOSED":
+                    # No dead item, but the source content moved behind the
+                    # closed carry — "原来那一窗后来又订正" invalidates the close
+                    # until re-derived.
+                    cur.execute(
+                        """UPDATE gap_carries
+                           SET status = 'REOPENED', target_version = NULL,
+                               matched_snapshot = NULL, closed_at = NULL,
+                               reopened_at = now()
+                           WHERE id = %s""",
+                        (cid,),
+                    )
+                    cur.execute(
+                        """UPDATE gap_carry_items
+                           SET item_status = 'CARRIED', matched_version = NULL,
+                               matched_against = NULL, updated_at = now()
+                           WHERE carry_id = %s AND item_status = 'MATCHED'""",
+                        (cid,),
+                    )
+                    carry_event(cur, cid, key, "CARRY_REOPENED", detail={
+                        "reason": "source_corrected", "trigger": reason})
+                    log.info("gap carry %s REOPENED by source window %d correction", cid, ws)
+    return voided_targets
+
+
+def derive_carries(conn):
+    """Derive every live carry's item state from its target's CURRENT head.
+
+    Runs once per tick after close/orders: target payloads already include
+    live carry events (carries_for_window at emit time), and each carry pair is
+    tagged with the carry id. Here those tags drive the item rows:
+
+    - items the target no longer pairs: MATCHED -> CARRIED; a CLOSED carry with
+      any such item flips REOPENED (a target correction/withdrawal undid it —
+      "已经关上的必须重开，不能还显示对上了"); a fully-retracted target has no
+      head payload, which reopens every carry aimed at it;
+    - items newly paired: CARRIED -> MATCHED with the pairing event recorded;
+    - every item MATCHED closes the carry: status CLOSED, target_version and
+      the frozen matched_snapshot of "当时对上的样子", plus one order fold with
+      reason CARRY_RESOLVED (genuine progress that may close a WAITING order).
+
+    Idempotent: a carry whose derived state equals its stored state is untouched.
+    """
+    # (key, target_window, target_version) folds already recorded in this
+    # derivation: several carries closing in one tick at the same target share
+    # one CARRY_RESOLVED order version, not one each.
+    folded = set()
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT id, key, side, target_window_start
+               FROM gap_carries
+               WHERE status IN ('OPEN', 'REOPENED', 'CLOSED')
+               ORDER BY id""")
+        live = cur.fetchall()
+        # One key at a time, gate lock first and carry rows second — the same
+        # order as create_carry/invalidate/emit, so concurrent writers cannot
+        # deadlock against this sweep.
+        by_key = {}
+        for cid, key, side, tws in live:
+            by_key.setdefault(key, []).append((cid, side, tws))
+        for key in sorted(by_key):
+            cur.execute(
+                "INSERT INTO release_gates (key) VALUES (%s) ON CONFLICT (key) DO NOTHING",
+                (key,),
+            )
+            cur.execute("SELECT 1 FROM release_gates WHERE key = %s FOR UPDATE", (key,))
+            cur.fetchone()
+        for cid, key, side, tws in live:
+            cur.execute("SELECT status, target_version FROM gap_carries WHERE id = %s FOR UPDATE",
+                        (cid,))
+            status, closed_version = cur.fetchone()
+            head = get_head(cur, tws, key)
+            payload = head["payload"] if head and head["status"] != "RETRACTED" else None
+            cur.execute(
+                """SELECT event_id, item_status, matched_version, matched_against
+                   FROM gap_carry_items WHERE carry_id = %s ORDER BY event_id""",
+                (cid,),
+            )
+            full = cur.fetchall()
+            cur_ids = {eid for eid, *_ in full}
+
+            # The target payload's CURRENT view of this carry:
+            # {carried_event_id: (opposite event id, target version)}.
+            current_pairs = {}
+            if payload is not None:
+                other = opposite_side(side)
+                for p in payload.get("pairs", []):
+                    tag = p.get("carry")
+                    if tag and tag.get("carry_id") == cid:
+                        current_pairs[p[f"{side}_event_id"]] = (
+                            p[f"{other}_event_id"], head["version"])
+
+            def reopen(reason, detail):
+                """Move the carry back to REOPENED (CLOSED -> open); the rest
+                of this same derivation re-closes it when everything still
+                pairs, recording a fresh close snapshot and event trail."""
+                cur.execute(
+                    """UPDATE gap_carries
+                       SET status = 'REOPENED', target_version = NULL,
+                           matched_snapshot = NULL, closed_at = NULL,
+                           reopened_at = now()
+                       WHERE id = %s""",
+                    (cid,),
+                )
+                cur.execute(
+                    """UPDATE gap_carry_items
+                       SET item_status = 'CARRIED', matched_version = NULL,
+                           matched_against = NULL, updated_at = now()
+                       WHERE carry_id = %s""",
+                    (cid,),
+                )
+                carry_event(cur, cid, key, "CARRY_REOPENED", detail=detail)
+                log.info("gap carry %s REOPENED (%s): %s", cid, reason, detail)
+
+            lost = [eid for eid, st, _, _ in full
+                    if st == "MATCHED" and eid not in current_pairs]
+            drift = []
+            if status == "CLOSED" and not lost:
+                # Every event still pairs, but did the pairing (or the target
+                # version) move? "对上了" froze the then-current match; a
+                # different match/version must visibly reopen+reclose.
+                for eid, st, mv, magainst in full:
+                    now_pair = current_pairs.get(eid)
+                    if (st == "MATCHED" and now_pair is not None
+                            and (now_pair[0] != magainst or now_pair[1] != mv)):
+                        drift.append({"event_id": eid,
+                                      "matched_against": magainst,
+                                      "now_against": now_pair[0]})
+            if status == "CLOSED" and (lost or drift):
+                reopen("target correction", {
+                    "reason": "target_corrected",
+                    "lost_events": lost, "drifted_pairs": drift,
+                    "target_window_start": tws,
+                    "target_version": head["version"] if head else None})
+                status = "REOPENED"
+            # Record fresh pairings for OPEN/reopened carries. A CLOSED carry
+            # with nothing lost and nothing drifted is fully stable: its
+            # snapshot/events are never rewritten on repeat derivations.
+            new_pairs = []
+            if status in ("OPEN", "REOPENED") and payload is not None:
+                new_pairs = sorted(current_pairs)
+                for eid in new_pairs:
+                    against_eid, ver = current_pairs[eid]
+                    cur.execute(
+                        """UPDATE gap_carry_items
+                           SET item_status = 'MATCHED', matched_version = %s,
+                               matched_against = %s, updated_at = now()
+                           WHERE carry_id = %s AND event_id = %s
+                             AND item_status = 'CARRIED'""",
+                        (ver, against_eid, cid, eid),
+                    )
+                    # Rowcount guard: the same target version persists across
+                    # ticks, so only the transition CARRIED -> MATCHED writes
+                    # the event — a repeat derivation is a no-op, not another
+                    # ITEM_MATCHED.
+                    if cur.rowcount:
+                        carry_event(cur, cid, key, "ITEM_MATCHED",
+                                    target_version=ver, detail={
+                                        "event_id": eid, "matched_against": against_eid,
+                                        "target_window_start": tws})
+            paired = set(current_pairs)
+            if status in ("OPEN", "REOPENED") and cur_ids and cur_ids <= paired:
+                # Everything matched: close the carry and freeze the picture.
+                cur.execute(
+                    """SELECT event_id, matched_against
+                       FROM gap_carry_items WHERE carry_id = %s ORDER BY event_id""",
+                    (cid,),
+                )
+                matches = [{"event_id": eid, "matched_against": other}
+                           for eid, other in cur.fetchall()]
+                snapshot = {
+                    "target_window_start": tws,
+                    "target_version": head["version"],
+                    "target_payload_hash": head["payload_hash"],
+                    "side": side,
+                    "matches": matches,
+                }
+                cur.execute(
+                    """UPDATE gap_carries
+                       SET status = 'CLOSED', target_version = %s,
+                           matched_snapshot = %s, closed_at = now(),
+                           reopened_at = NULL, voided_at = NULL
+                       WHERE id = %s""",
+                    (head["version"], psycopg2.extras.Json(snapshot), cid),
+                )
+                carry_event(cur, cid, key, "CARRY_CLOSED",
+                            target_version=head["version"], detail=snapshot)
+                log.info("gap carry %s CLOSED at target window %d v%d (%d events)",
+                         cid, tws, head["version"], len(matches))
+                # The carry resolution is genuine progress: re-fold the order so
+                # a WAITING order can reach CLOSED without waiting for another
+                # result version. One CARRY_RESOLVED version per (target, target
+                # version) — deduplicated across carries closing this sweep and
+                # against prior sweeps via the order-version history check.
+                sig = (key, tws, head["version"])
+                if sig not in folded:
+                    folded.add(sig)
+                    cur.execute("SELECT id FROM biz_orders WHERE key = %s", (key,))
+                    order_row = cur.fetchone()
+                    already = False
+                    if order_row is not None:
+                        cur.execute(
+                            """SELECT 1 FROM biz_order_versions
+                               WHERE order_id = %s AND reason = 'CARRY_RESOLVED'
+                                 AND trigger_window_start = %s
+                                 AND trigger_result_version = %s LIMIT 1""",
+                            (order_row[0], tws, head["version"]),
+                        )
+                        already = cur.fetchone() is not None
+                    if order_row is not None and not already:
+                        cur.execute(
+                            "SELECT id FROM results WHERE window_start = %s AND key = %s "
+                            "AND version = %s",
+                            (tws, key, head["version"]),
+                        )
+                        rid = cur.fetchone()[0]
+                        fold_order(cur, key, "CARRY_RESOLVED", tws, head["version"], rid)
+
+
+def emit_voided_targets(conn, voided_targets):
+    """Carries voided this tick took their events out of the target's pairing:
+    an already-emitted target window must be corrected in the same tick.
+    Targets with no result yet need nothing: their normal INITIAL render
+    (carries_for_window skips VOID carries) is already correct."""
+    for key, tws in sorted(voided_targets):
+        with conn.cursor() as cur:
+            h = get_head(cur, tws, key)
+        if h is not None:
+            emit(conn, tws, key, "CARRY_FORWARD", {"op": "carry_voided"})
+
+
 def tick(conn):
     dirty = []
     for stream, base_url in INGESTS.items():
         dirty.extend(pull_stream(conn, stream, base_url))
     refresh_watermarks(conn)
-    # Late data first: recompute only windows that already have a result —
+    # Carries whose SOURCE window changed are re-validated first: a retracted
+    # or source-paired carried event voids the carry (dead forever) before any
+    # window is re-rendered, so neither source nor target keeps pairing a dead
+    # event; a closed carry whose source merely corrected is reopened.
+    voided_targets = invalidate_dirty_carries(conn, dirty)
+    # Late data: recompute only windows that already have a result —
     # windows not yet emitted will be covered by close_windows below.
     seen = set()
     for ws, key, reason, detail in dirty:
@@ -1298,6 +2049,13 @@ def tick(conn):
             emit(conn, ws, key, reason, detail)
     close_windows(conn)
     build_orders(conn)
+    # Recompute already-emitted targets of carries voided this tick (their
+    # carry events just vanished from the pairing), then derive every live
+    # carry's item state from the now-current target heads — partial matches,
+    # close (with the frozen match snapshot + CARRY_RESOLVED order fold) and
+    # target-correction reopen all happen here.
+    emit_voided_targets(conn, voided_targets)
+    derive_carries(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -3013,7 +3771,10 @@ def orders(status: Optional[str] = None, key: Optional[str] = None):
                     o.created_at, o.updated_at,
                     count(w.order_id) AS windows,
                     count(w.order_id) FILTER (WHERE w.result_status = 'CURRENT') AS live_windows,
-                    count(w.order_id) FILTER (WHERE w.has_gap) AS gap_windows
+                    count(w.order_id) FILTER (WHERE w.has_gap) AS gap_windows,
+                    (SELECT count(*) FROM gap_carries c
+                      WHERE c.key = o.key
+                        AND c.status IN ('OPEN', 'REOPENED')) AS open_carries
              FROM biz_orders o
              LEFT JOIN biz_order_windows w ON w.order_id = o.id"""
     conds, args = [], []
@@ -3050,7 +3811,8 @@ def orders_current(key: str):
                     return {"order": None}
                 cur.execute(
                     """SELECT window_start, window_end, result_version, result_status,
-                              has_gap, match_count, unmatched_a, unmatched_b, payload_hash
+                              has_gap, match_count, unmatched_a, unmatched_b,
+                              carried_a, carried_b, payload_hash
                        FROM biz_order_windows WHERE order_id = %s ORDER BY window_start""",
                     (order["id"],),
                 )
@@ -3340,6 +4102,168 @@ def window_graces(window_start: Optional[int] = None, key: Optional[str] = None,
     finally:
         conn.close()
     return {"graces": rows, "count": len(rows)}
+
+
+# ---------------------------------------------------------------------------
+# gap carry-forwards (缺口结转)
+# ---------------------------------------------------------------------------
+
+class CarryIn(BaseModel):
+    key: str = Field(min_length=1, max_length=200)
+    source_window_start: int = Field(
+        ge=0, description="closed window whose leftovers are routed out")
+    target_window_start: int = Field(
+        ge=0, description="LATER window (same key) that has not emitted yet")
+    side: str = Field(description="which side's leftovers ride the carry: a|b")
+    event_ids: Optional[list[str]] = Field(
+        default=None,
+        description="subset of the source side's CURRENT unmatched events; "
+                    "default = every leftover on that side")
+    operator: Optional[str] = Field(default=None, max_length=200)
+    note: Optional[str] = Field(default=None, max_length=2000)
+
+
+def carry_json(cur, row):
+    """One carry header plus its item rows and live counters."""
+    cur.execute(
+        """SELECT event_id, event_time, side, item_status, matched_version,
+                  matched_against, updated_at
+           FROM gap_carry_items WHERE carry_id = %s
+           ORDER BY event_time, event_id""",
+        (row["id"],),
+    )
+    items = [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()]
+    carried = [i for i in items if i["item_status"] == "CARRIED"]
+    out = dict(row)
+    out["items"] = items
+    out["item_count"] = len(items)
+    out["matched_count"] = len(items) - len(carried)
+    return out
+
+
+@app.post("/gap-carries", status_code=201)
+def gap_carry_create(body: CarryIn):
+    """Open a gap carry: route one side's unmatched leftovers of a CLOSED
+    source window to a later, not-yet-emitted window of the SAME key.
+
+    The carried events leave the source's unmatched gap (the source gets a
+    CARRY_FORWARD correction recording the route) and are injected into the
+    target side when IT emits; pairs they form are tagged with this carry id
+    (never written as the target's own native pairs). While unpaired the carry
+    is OPEN and queryable (from which window to which, carrying which events);
+    once every event pairs it closes and freezes the close-time match
+    snapshot. Rules (all 409 unless noted): target must not have emitted yet;
+    source must have a live one-sided leftover on that side; different keys
+    can never share a carry; one unmatched event can never be in two open
+    carries — nor carried again after its carry was voided; target must be a
+    later window boundary (422).
+    """
+    if body.event_ids is not None:
+        if not body.event_ids:
+            raise HTTPException(422, "event_ids must be non-empty when given")
+        if len(body.event_ids) != len(set(body.event_ids)):
+            raise HTTPException(422, "event_ids must not repeat")
+    conn = connect()
+    try:
+        try:
+            carry = create_carry(conn, body.source_window_start,
+                                 body.target_window_start, body.key, body.side,
+                                 body.event_ids, body.operator, body.note)
+        except psycopg2.errors.UniqueViolation:
+            raise HTTPException(
+                409, "one of these events already rides another carry "
+                     "(open, closed or void) — 同一条不能结第二次")
+    finally:
+        conn.close()
+    return {"carry": carry}
+
+
+@app.get("/gap-carries")
+def gap_carries(key: Optional[str] = None, status: Optional[str] = None,
+                side: Optional[str] = None, source_window_start: Optional[int] = None,
+                target_window_start: Optional[int] = None,
+                open_only: bool = False, limit: int = Query(default=200)):
+    """Carry ledger — for every carry: OPEN/CLOSED/REOPENED/VOID, which source
+    window routes to which target window, which side, which events ride it and
+    which of them have paired (with the opposing event and target version).
+    CLOSED carries carry the frozen matched_snapshot ("当时对上的样子").
+    Filters: key / status / side / source window / target window / open_only.
+    """
+    if status is not None and status not in ("OPEN", "CLOSED", "REOPENED", "VOID"):
+        raise HTTPException(422, "status must be OPEN, CLOSED, REOPENED or VOID")
+    if side is not None and side not in ("a", "b"):
+        raise HTTPException(422, "side must be 'a' or 'b'")
+    conds, args = [], []
+    if key is not None:
+        conds.append("c.key = %s")
+        args.append(key)
+    if status is not None:
+        conds.append("c.status = %s")
+        args.append(status)
+    if side is not None:
+        conds.append("c.side = %s")
+        args.append(side)
+    if source_window_start is not None:
+        conds.append("c.source_window_start = %s")
+        args.append(source_window_start)
+    if target_window_start is not None:
+        conds.append("c.target_window_start = %s")
+        args.append(target_window_start)
+    if open_only:
+        conds.append("c.status IN ('OPEN', 'REOPENED')")
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"""SELECT c.* FROM gap_carries c{where}
+                    ORDER BY c.id DESC LIMIT %s""",
+                args + [min(max(limit, 1), 5000)],
+            )
+            rows = [carry_json(cur, r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    return {"carries": rows, "count": len(rows)}
+
+
+@app.get("/gap-carries/{carry_id}")
+def gap_carry_get(carry_id: int):
+    """One carry: header, frozen close-time snapshot (when CLOSED) and each
+    carried event's current item state."""
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM gap_carries WHERE id = %s", (carry_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise HTTPException(404, "no such gap carry")
+            payload = carry_json(cur, row)
+    finally:
+        conn.close()
+    return {"carry": payload}
+
+
+@app.get("/gap-carries/{carry_id}/events")
+def gap_carry_events(carry_id: int, limit: int = Query(default=1000)):
+    """Append-only carry trail, chronological: CARRY_OPENED, every
+    ITEM_MATCHED, CARRY_CLOSED (with the frozen snapshot), CARRY_REOPENED
+    (source/target later corrected or withdrew) and CARRY_VOIDED (a carried
+    event was retracted or paired at the source — dead forever)."""
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT key FROM gap_carries WHERE id = %s", (carry_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(404, "no such gap carry")
+            cur.execute(
+                """SELECT * FROM gap_carry_events
+                   WHERE carry_id = %s ORDER BY id LIMIT %s""",
+                (carry_id, min(max(limit, 1), 5000)),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {"carry_id": carry_id, "events": rows}
 
 
 # ---------------------------------------------------------------------------

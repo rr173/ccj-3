@@ -53,6 +53,7 @@
 | 对齐规则 | 窗口内同 key 的 A、B 事件按 `(event_time, event_id)` 排序后顺序配对；多余的一侧记入 `unmatched_*`；只有单边数据也出结果 |
 | 晚到事件 | 落在已关窗窗口的事件 → 重算该 (窗口, key)，内容变化则产生新版本（`LATE_EVENT`） |
 | 回撤 | `type=retract, retracts=<event_id>` 删除已收事件 → 重算并产生新版本（`RETRACTION`）；结果清空时版本状态为 `RETRACTED` |
+| 缺口结转 | 结转开出/作废触发源窗、后窗重算时版本原因为 `CARRY_FORWARD`（对外按 CORRECTION 投递）；payload 的 pair 上 `carry` 字段标记结转对（原生对为 `null`），源窗 payload 的 `carried.a/b` 记录已结转到别处的事件（见下"缺口结转"） |
 | 订正幂等 | 重算结果内容哈希不变 → **不产生新版本**。同一结果绝不会被重复计算还当作成功 |
 
 结果版本模型：每个 `(window_start, key)` 有一个 head 版本（`CURRENT` 或 `RETRACTED`），
@@ -333,6 +334,53 @@ no-op。
 - 作废的单不能再冒充新单：key 唯一约束使新结果只能进同一张单，作废章节永远留在它的
   版本历史里；`status=CLOSED` 才是成功单，作废单天然不在其列。
 
+## 缺口结转（gap carry-forward）
+
+某一窗已经出了结果、一边对不上多出来几条时，可以把这几条**指定接到同一业务键后面的另一窗**
+去对（后窗必须还没出过结果）。结转是"路由"而不是改配对：源窗自己的配对一格不动，多出来的事件
+从源窗的 `unmatched_*` 缺口里移出、记在结果 payload 的 `carried.a/b` 上；后窗出结果时这些事件
+注入对应一侧，与后窗**自己的对面剩余**配对，且每一对都带 `carry: {carry_id,
+source_window_start}` 标记——看得出是结转对上的，绝不会写成后窗自己来的一对。
+
+| 概念 | 定义 |
+|---|---|
+| 结转（carry） | 一键、一侧、源窗 → 一个**更晚且未出结果**的后窗的路由，带上若干条当时 `unmatched_*` 的事件 |
+| `OPEN` | 开着（含部分已对上）：还没全部对上。能查它从哪窗接到哪窗、哪一侧、带着哪几条、每条当前状态 |
+| `CLOSED` | 带的事件全部在后窗对上了：关上，并在 `matched_snapshot` 留下**当时对上的样子**（后窗版本号、每条对上了谁、后窗 payload 哈希） |
+| `REOPENED` | 关上后**后窗**又订正/回撤（或源窗订正使内容漂移），结转对不上了：必须重开，绝不能还显示对上了；重开后下一轮推导若又能对上则重新关上并刷新快照 |
+| `VOID` | 作废且**终结**：某条被携带的事件在源窗被回撤（`source_retracted`），或晚到的对面事件在**源窗**就把它配上了（`source_paired`，再接走就是重复计数） |
+
+规则：
+
+| 规则 | 行为 |
+|---|---|
+| 只能接未出结果的后窗 | 后窗已存在 head（哪怕当前是 `RETRACTED`）再接一律 `409`——已经出过结果的变化只能走订正路径 |
+| 同键、更晚、整窗 | 源/后窗必须是同一业务键、后窗晚于源窗、窗起点必须是窗边界，否则 `422`/`404`；不同业务键结不到一张上 |
+| 源窗条件 | 源窗必须有 CURRENT 结果且指定侧当下确有 `unmatched_*`；可指定子集（默认全带走）；不满足 `404`/`409` |
+| 结转过的不能结第二次 | 一条事件在 `gap_carry_items` 里**全局唯一**（含 CLOSED/VOID 的历史）：重复申请 `409`，数据库唯一索引兜底并发 |
+| 不能同时待在两张开着的结转里 | 同上：一条事件至多在一张结转上，无论那张是 OPEN 还是 REOPENED |
+| 源窗同事务留痕 | 开出结转的同一逻辑动作里源窗出一版 `CARRY_FORWARD` 结果：缺口消失、事件进 `carried`；对外投递按 CORRECTION 走 |
+| 原生配对不被挤占 | 后窗先在自己两侧间按 `(event_time, event_id)` 配对；结转事件只与后窗**自己的对面剩余**配，两个结转争一个剩余时按结转 id 先建先得；结转事件之间永不互配 |
+| 部分对上保持 OPEN | 带 N 条、只对上 K 条：K 条 MATCHED（记下对上谁、后窗版本），其余仍 CARRIED；结转留在 OPEN，后窗 `unmatched_*` 只放它自己的剩余 |
+| 关上留当时样子 | 全部对上 → CLOSED，`target_version` + 不可变 `matched_snapshot` 定格；`gap_carry_events` 追加 `ITEM_MATCHED`/`CARRY_CLOSED`（只增不改） |
+| 源窗后来订正/回撤 | 结转的任何一条失效 → 整张 VOID（DEAD 事件、原因、已出结果的后窗同 tick 订正掉该 carry 对）；CLOSED 但只是内容漂移 → REOPENED 后重新推导 |
+| 后窗后来订正/回撤 | 已关上的结转一旦某条在后窗不再成对 → REOPENED（清掉旧 target_version/快照），绝不还显示 CLOSED；后窗整窗回撤同样重开；重新对上再 CLOSED（新快照） |
+| 作废终结 | VOID 结转的事件永远不能再拿去对、再开结转也是 `409`；后窗渲染自动跳过 VOID 结转 |
+| 与业务单 | 有 OPEN/REOPENED 结转时业务单不能 CLOSED（停在 WAITING/REOPENED）；结转关上那一 tick 追加一版 `CARRY_RESOLVED` 整单版本，满足关单条件即关单 |
+| 与放行/投递 | 源窗结转标注、后窗 carry 对都是普通结果版本：受放行闸门约束，对外 reason 为 CARRY_FORWARD（投递为 CORRECTION），下游按同一 `(window_start, key)` 订正，不产生第二笔成功 |
+
+| 方法/路径 | 说明 |
+|---|---|
+| `POST /gap-carries` | `{"key", "source_window_start", "target_window_start", "side":"a"|"b", "event_ids"?, "operator"?, "note"?}`：开一张结转（201）；源无活结果 `404`；后窗已出结果/事件不是当下缺口/事件已在别的（含作废的）结转上 `409`；参数不合法 `422` |
+| `GET /gap-carries?key=&status=&side=&source_window_start=&target_window_start=&open_only=` | 结转台账（倒序）：状态、源→后窗、侧、逐条 item 状态（CARRIED/MATCHED/DEAD、对上谁、哪一版）、CLOSED 的 `matched_snapshot`、VOID 的 `void_reason` |
+| `GET /gap-carries/{id}` | 一张结转的完整当前态（头 + 全部条目） |
+| `GET /gap-carries/{id}/events` | 该结转只增流水（正序）：`CARRY_OPENED` / `ITEM_MATCHED` / `CARRY_CLOSED` / `CARRY_REOPENED` / `CARRY_VOIDED` |
+
+结果 payload 中，结转对上的一对形如：
+`{"a_event_id":"a2","b_event_id":"b4","a_payload":...,"b_payload":...,"carry":{"carry_id":7,"source_window_start":1736000000000}}`；
+后窗自己的原生对 `carry` 为 `null`，另有 `match_count`（原生）与 `carry_match_count`（结转）两个计数；
+源窗 payload 新增 `carried: {"a":[...], "b":[...]}` 记录本窗已结转到别处的事件。
+
 ## 边界情况行为矩阵
 
 | 情况 | 行为 |
@@ -384,6 +432,15 @@ no-op。
 | 不认它没入过（NOT_REPORTED+驳） | 结账落 REDRIVE：即使旧行已 DELIVERED 也插一条新投递（新 delivery_id、同版本、redelivery_seq=1）真再 POST 一次，直到它报到；报到即 FULFILLED 恢复正常 |
 | 认了"对上重试中"（AHEAD+认） | MARK_DELIVERED：结账时把报到版及以下在途行置 DELIVERED、台账对齐并留痕；驳了则无动作（NONE），照旧重试 |
 | 同一笔想落第二次账 | 后来批次的 close 返回 409 并点名已由哪批落过（FULFILLED 也算）；`GET /settlements` 可查每条钉在哪一版 |
+| 把一窗的缺口接到后面 | 源窗出 CARRY_FORWARD 订正版（缺口进 `carried`）；后窗出结果时结转事件与后窗自己的对面剩余配，每对带 carry 标记（carry id+源窗），原生对 carry 为 null |
+| 结转出去的再结第二次 | 409：一条事件在结转条目表里全局唯一，即使上一张已 CLOSED/VOID 也不行（唯一索引兜底并发） |
+| 同一条待在两张开着的结转里 | 同上，第二张开不出来（409） |
+| 接到已经出过结果的后窗 | 409：只能接未出结果的窗（连 RETRACTED 过的也不行）；不同键、后窗不晚于源窗、非窗边界同样拒绝 |
+| 结转还没对上时查 | GET 看到 OPEN、源窗→后窗、侧、带着哪几条、每条 CARRIED/MATCHED；部分对上保持 OPEN |
+| 结转对上了 | 自动 CLOSED：target_version + 冻结 matched_snapshot（当时每条对上谁），流水留 ITEM_MATCHED/CARRY_CLOSED；业务单同 tick 追加 CARRY_RESOLVED 版本并可关单 |
+| 源窗后来回撤/订正 | 被带事件被回撤或在源窗被晚到对面配上 → 结转 VOID（事件 DEAD、已出结果的后窗同 tick 去掉该 carry 对订正）；只是内容漂移的 CLOSED 结转先 REOPENED 再重新推导；VOID 永远不能再对 |
+| 后窗后来订正/回撤 | CLOSED 结转立即 REOPENED（清掉旧版本号与快照），绝不还显示对上；重新全对上再 CLOSED（新快照）；整窗回撤同样重开 |
+| 后窗里结转事件和原生事件抢配对 | 永远先配后窗自己的原生对，结转事件只配对面剩余；两个结转争一个剩余时按结转 id 先建先得；结转事件之间不互配 |
 
 ## 快速开始
 
@@ -391,7 +448,7 @@ no-op。
 cd stream-aligner
 docker compose up -d --build     # 或 make up
 bash scripts/demo.sh             # 或 make demo —— 完整演示下述所有场景
-python3 tests/test_e2e.py        # 或 make test —— 对运行中的栈做端到端断言（含业务单、对账批次、关窗宽限）
+python3 tests/test_e2e.py        # 或 make test —— 对运行中的栈做端到端断言（含业务单、对账批次、关窗宽限、缺口结转）
 python3 tests/test_core.py       # 或 make unit —— 纯逻辑单测，无需任何依赖
 ```
 
@@ -441,6 +498,10 @@ REDRIVE / MARK_DELIVERED / NONE：落后认了钉在报到版、驳了接着送�
 | `GET /windows` | 所有已知 (窗口, key) 的状态：是否关窗、head 版本、事件数；宽限中的窗另带 `grace_active`/`grace_due_at`/`grace_id` 与 `closed_effective` |
 | `POST /window-graces` | 给**还没出过结果**的一键一窗点关窗宽限：`{"window_start", "key", "extra_ms", "operator"?, "note"?}`；宽限期内不出 INITIAL，到点按当时版本出（仍一边就单边出），全撤空则 `EXPIRED`；已出过结果/已有 ACTIVE 宽限 `409`、无有效数据 `404`、窗起点不对齐 `422` |
 | `GET /window-graces?key=&window_start=&status=&active_only=` | 宽限台账：哪些窗正在宽、什么时候到期（`due_at`）、哪一键；`FIRED`（含 `fired_version`）/`EXPIRED` 历史只增保留 |
+| `POST /gap-carries` | 开缺口结转：`{"key", "source_window_start", "target_window_start", "side":"a"|"b", "event_ids"?, "operator"?, "note"?}`，把源窗一侧的缺口接到**同键更晚且未出结果**的后窗；后窗已出结果、事件不是当下缺口、事件已结转过（含作废的）`409`，源窗无活结果 `404`，参数不合法 `422` |
+| `GET /gap-carries?key=&status=&side=&source_window_start=&target_window_start=&open_only=` | 结转台账：OPEN/CLOSED/REOPENED/VOID、源→后窗、侧、每条状态、CLOSED 的 `matched_snapshot`、VOID 的 `void_reason` |
+| `GET /gap-carries/{id}` | 一张结转的完整当前态（头 + 逐条 item） |
+| `GET /gap-carries/{id}/events` | 该结转只增流水：开 / 逐条对上 / 关上（含快照）/ 重开 / 作废 |
 | `GET /orders?status=&key=` | 业务单当前状态（`OPEN`/`WAITING`/`CLOSED`/`REOPENED`/`VOID`）及各窗统计；`CLOSED` 即成功单 |
 | `GET /orders/current?key=` | 一张单的当前态：各窗进单时绑定的结果版本、还缺/在等的窗 |
 | `GET /orders/history?key=` | 一张单的全部整单版本：为什么被重开/作废、哪窗哪版触发、当时各窗版本快照 |

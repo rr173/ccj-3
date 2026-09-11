@@ -394,4 +394,81 @@ post "$A/watermark/override" '{"watermark":null}' >/dev/null
 post "$B/watermark/override" '{"watermark":null}' >/dev/null
 echo "overrides cleared"
 
+# ---------------------------------------------------------------------------
+# gap carry-forwards: a closed window's leftover routed to a later window
+# ---------------------------------------------------------------------------
+say "12. gap carry-forwards: a leftover of one window matches in a later window"
+NOW=$(python3 -c 'import time; print(int(time.time()*1000))')
+CWS=$(( NOW / WINDOW_MS * WINDOW_MS + 4 * WINDOW_MS ))
+CTGT=$(( CWS + WINDOW_MS ))
+CNEXT=$(( CTGT + WINDOW_MS ))
+CKEY="carry-demo"
+echo "source window [$CWS, $((CWS+WINDOW_MS))): A has two, B has one -> one A leftover"
+post "$A/events" '{"events":[
+  {"event_id":"c-a1","event_time":'"$((CWS+1000))"',"key":"'"$CKEY"'","payload":{"amount":1}},
+  {"event_id":"c-a2","event_time":'"$((CWS+2000))"',"key":"'"$CKEY"'","payload":{"amount":2}}]}' >/dev/null
+post "$B/events" '{"event_id":"c-b1","event_time":'"$((CWS+1500))"',"key":"'"$CKEY"'","payload":{"ship":"DHL"}}' >/dev/null
+post "$A/watermark/override" "{\"watermark\":$((CWS+WINDOW_MS))}" >/dev/null
+post "$B/watermark/override" "{\"watermark\":$((CWS+WINDOW_MS))}" >/dev/null
+wait_version "$CWS" "$CKEY" 1
+echo "source head (a2 is the unmatched_a gap):"
+curl -sf "$R/results/current?window_start=$CWS&key=$CKEY" | field "d['result']['payload']"
+
+say "12b. open a carry: route the A leftover to the next window (target not emitted yet)"
+CID=$(post "$R/gap-carries" "{
+  \"key\":\"$CKEY\",\"source_window_start\":$CWS,
+  \"target_window_start\":$CTGT,\"side\":\"a\",\"operator\":\"demo\"}" \
+  | field "d['carry']['id']")
+echo "opened carry id=$CID; the source gets a CARRY_FORWARD correction:"
+wait_version "$CWS" "$CKEY" 2 >/dev/null
+curl -sf "$R/results/current?window_start=$CWS&key=$CKEY" | field "d['result']['payload']"
+echo "carrying the same event a second time is rejected (409):"
+curl -s -o /dev/null -w "  http %{http_code}\n" -X POST "$R/gap-carries" -H 'Content-Type: application/json' -d "{
+  \"key\":\"$CKEY\",\"source_window_start\":$CWS,
+  \"target_window_start\":$CNEXT,\"side\":\"a\",\"event_ids\":[\"c-a2\"]}"
+
+say "12c. target window closes with an extra B -> the carried A pairs it, visibly a carry pair"
+post "$A/events" '{"event_id":"c-a3","event_time":'"$((CTGT+1000))"',"key":"'"$CKEY"'","payload":{"amount":3}}' >/dev/null
+post "$B/events" '{"events":[
+  {"event_id":"c-b3","event_time":'"$((CTGT+1500))"',"key":"'"$CKEY"'","payload":{"ship":"UPS"}},
+  {"event_id":"c-b4","event_time":'"$((CTGT+2500))"',"key":"'"$CKEY"'","payload":{"ship":"SF"}}]}' >/dev/null
+post "$A/watermark/override" "{\"watermark\":$((CTGT+WINDOW_MS))}" >/dev/null
+post "$B/watermark/override" "{\"watermark\":$((CTGT+WINDOW_MS))}" >/dev/null
+sleep 3
+echo "target head: native pair a3-b3, carry pair (tagged) c-a2-b4:"
+curl -sf "$R/results/current?window_start=$CTGT&key=$CKEY" | field "d['result']['payload']"
+echo "carry is CLOSED with the frozen close-time snapshot:"
+curl -sf "$R/gap-carries/$CID" | field "{'status':d['carry']['status'],'target_version':d['carry']['target_version'],'snapshot':d['carry']['matched_snapshot']}"
+
+say "12d. target later corrects (the B it matched is retracted) -> carry REOPENS"
+post "$B/events" '{"event_id":"c-rb4","event_time":'"$((CTGT+3000))"',"key":"'"$CKEY"'","type":"retract","retracts":"c-b4"}' >/dev/null
+for i in $(seq 1 20); do
+  ST=$(curl -sf "$R/gap-carries/$CID" | field "d['carry']['status']")
+  [ "$ST" = "REOPENED" ] && break; sleep 1
+done
+echo "  carry status now: $ST (must not still show CLOSED)"
+echo "a fresh B pairs it again -> CLOSED with a new snapshot:"
+post "$B/events" '{"event_id":"c-b5","event_time":'"$((CTGT+4000))"',"key":"'"$CKEY"'","payload":{"ship":"SFX"}}' >/dev/null
+for i in $(seq 1 20); do
+  ST=$(curl -sf "$R/gap-carries/$CID" | field "d['carry']['status']")
+  [ "$ST" = "CLOSED" ] && break; sleep 1
+done
+curl -sf "$R/gap-carries/$CID" | field "{'status':d['carry']['status'],'matched_against':d['carry']['matched_snapshot']['matches']}"
+
+say "12e. the source carried event is retracted -> carry VOID (dead forever)"
+post "$A/events" '{"event_id":"c-ra2","event_time":'"$(python3 -c 'import time; print(int(time.time()*1000))')"',"key":"'"$CKEY"'","type":"retract","retracts":"c-a2"}' >/dev/null
+for i in $(seq 1 20); do
+  ST=$(curl -sf "$R/gap-carries/$CID" | field "d['carry']['status']")
+  [ "$ST" = "VOID" ] && break; sleep 1
+done
+echo "  carry status now: $ST (void_reason + append-only trail:)"
+curl -sf "$R/gap-carries/$CID" | field "{'status':d['carry']['status'],'void_reason':d['carry']['void_reason'],'items':[(i['event_id'],i['item_status']) for i in d['carry']['items']]}"
+curl -sf "$R/gap-carries/$CID/events" | field "[(e['event'],e.get('target_version')) for e in d['events']]"
+echo "trying to carry the voided event again is rejected (409):"
+curl -s -o /dev/null -w "  http %{http_code}\n" -X POST "$R/gap-carries" -H 'Content-Type: application/json' -d "{
+  \"key\":\"$CKEY\",\"source_window_start\":$CWS,
+  \"target_window_start\":$CNEXT,\"side\":\"a\",\"event_ids\":[\"c-a2\"]}"
+post "$A/watermark/override" '{"watermark":null}' >/dev/null
+post "$B/watermark/override" '{"watermark":null}' >/dev/null
+
 say "demo finished OK"
