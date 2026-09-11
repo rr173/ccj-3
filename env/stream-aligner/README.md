@@ -59,6 +59,45 @@
 旧版本置为 `SUPERSEDED` 但**永久保留**；每次版本跃迁写一条 `audit`（原因 + 触发事件明细），
 `GET /results/history` 可以回答"某次结果为什么被改过"。
 
+## 关窗宽限（window grace）
+
+常态下 `(窗口, key)` 在**它自己的两侧**都越过窗尾时出 INITIAL；有时想让某一笔
+（某个业务键的某一个窗）**多等对面一会儿**，又不想动水位、不想拖别的业务——
+这就是关窗宽限。宽限**只点这一键这一窗**：
+
+| 规则 | 行为 |
+|---|---|
+| 指定一键一窗 | `POST /window-graces {"window_start", "key", "extra_ms"}`：给这个还**没出过结果**的窗一段墙钟宽限；到期点 = 受理时刻 + `extra_ms` |
+| 只宽这一个 | 宽限期内即使这一键的两侧都已越过窗尾，这一窗也**先别出**；别的键、同键别的窗一律按各自原窗尾走，绝不被它拖住 |
+| 到期按当时版本出 | 到点那一刻全量重算**当时**的内部数据并出 INITIAL（审计 detail 带 `grace.fired_at_deadline`）；宽限期里到的晚到事件照常折进这一版——对面来了，出的就是对齐版 |
+| 到点还是一边 | 照常按**单边**出（`unmatched_*` 带缺口），不再空等；宽限行置 `FIRED`、记 `fired_version` |
+| 到点数据没了 | 宽限期里事件全被回撤、到点无有效数据 → 不出结果，宽限行置 `EXPIRED`（作废），恢复常态按业务键关窗；之后再来数据可重新点宽限 |
+| 出过结果不能再宽 | 该窗已存在 head 版本（哪怕当前是 `RETRACTED`）再点 → `409`；已出结果的变化只能走晚到/回撤的订正版本路径 |
+| 不能叠两条 | 同一 `(window_start, key)` 已有 `ACTIVE` 宽限再点 → `409`（DB 部分唯一索引兜底，并发也叠不上） |
+| 没有数据不能点 | 窗内没有任何有效（未回撤）事件 → `404`；`window_start` 不是窗边界 → `422`；`extra_ms > 30天` → `422` |
+| 只增留痕 | `window_graces` 行只插不删：`ACTIVE`（在宽）/ `FIRED`（到点出了）/ `EXPIRED`（到点空了）全程可查 |
+
+与其他机制的关系：
+
+- **与放行闸门正交**：宽限管的是**内部结果什么时候算出来**，放行管的是算出来后**推不推下游**。
+  宽限期里内部版本照常可查的前提是"已经算出来"——宽限的全部作用就是让第一版晚一点算；
+  到期出的那一版之后受不受放行闸门约束，与其他 INITIAL 完全一致（闸门默认关时它先扣着）。
+- **晚到/回撤**：宽限期里到达的晚到/回撤事件与平时无差别落库；到期 emit 是全量重算，
+  所以出的就是当时那一版，不存在"先出单边再立刻订正"的抖动。
+- **业务单**：宽限中的窗对业务单算 `pending`（明确在等，不是 `missing`），不会把单误判成
+  缺窗；到期出结果的同一个 tick 里业务单照常折叠。
+- **并发**：授予/到期发射/放行/闸门都按"先取该键 `release_gates` 行锁、再取宽限行锁"
+  的同一顺序，到期 FIRE 的版本行、审计、outbox、`FIRED` 标记同一事务提交。
+
+| 方法/路径 | 说明 |
+|---|---|
+| `POST /window-graces` | `{"window_start", "key", "extra_ms", "operator"?, "note"?}`：给未出结果的一键一窗加宽限（201）；已出结果/已有 ACTIVE 宽限 `409`、无有效数据 `404`、参数不合法 `422` |
+| `GET /window-graces?key=&window_start=&status=&active_only=` | 宽限台账（倒序）：哪些窗正在宽、`due_at` 什么时候到期、哪一键、`FIRED` 的版本号 / `EXPIRED` 作废时间 |
+
+`GET /windows` 的每行同时带 `grace_active` / `grace_due_at` / `grace_extra_ms` /
+`grace_id` 与 `closed_effective`（两侧越过**且**没有 ACTIVE 宽限——宽限期里
+`closed=true` 但还没有 head 是唯一的合法例外）。
+
 ## 下游投递
 
 结果不再只能查：登记下游接收地址后，每个结果版本都会**推**过去。
@@ -314,6 +353,13 @@ no-op。
 | 整笔撤空 | 所有窗被撤回 → 单 `VOID` 作废，不算成功单；再来新结果仍是同一张单继续，不冒充新单 |
 | 关单后来订正 | 即使订正后两边仍对得上，单也先 `REOPENED`（绝不"还显示关着"）；后续新结果满足关单条件时才重新 `CLOSED` |
 | 关单后撤掉一窗 | 被撤的窗是未了结缺口，单 `REOPENED` 且不再关单，直到该窗复活或整笔撤空转 `VOID` |
+| 给没出的窗点宽限 | 只宽这一键这一窗：宽限期内即使两侧都越过窗尾也不出 INITIAL；别的键、同键别的窗照原窗尾走，不被它拖住。`GET /window-graces` 能查在宽的窗、到期点、哪一键 |
+| 宽限期内对面来了 | 晚到/回撤照常落内部、重算；宽限没到点不出；到期出的就是**当时那一版**（来了对面就是对齐版） |
+| 到点还是一边 | 按单边出（`unmatched_*` 带缺口），宽限行置 `FIRED` + `fired_version`，不再空等 |
+| 宽限期里全撤空了 | 到点无有效数据 → 宽限作废（`EXPIRED`）、不出结果，恢复常态等待；之后再来数据可以重新点一次宽限 |
+| 给已出过结果的窗再宽 | `409`：head 已存在（哪怕当前是 `RETRACTED`）都不能再宽，订正/回撤只能走版本路径 |
+| 同一窗叠两条宽限 | 已有 `ACTIVE` 宽限再点 `409`（部分唯一索引兜底）；`FIRED`/`EXPIRED` 是历史，不挡查询；`EXPIRED` 后有新数据可再点 |
+| 点一个没有有效数据的窗 | `404`（没有可等的东西）；`window_start` 不是窗边界 `422` |
 | 结果已算但没放行 | 内部版本、审计、业务单照常可查；不生成 deliveries，下游收不到；扣着期间晚到/回撤照改内部版 |
 | 放行扣着的窗口 | `POST /releases` 发**放行那一刻的 head**，中间压过的版本不补投；只影响点到的这一键，其他键继续扣 |
 | 放行后订正/撤回 | 放行记录不可撤销，闸门开关都不再影响该窗口：CORRECTION / WITHDRAWAL / 复活版照投 |
@@ -345,7 +391,7 @@ no-op。
 cd stream-aligner
 docker compose up -d --build     # 或 make up
 bash scripts/demo.sh             # 或 make demo —— 完整演示下述所有场景
-python3 tests/test_e2e.py        # 或 make test —— 对运行中的栈做端到端断言（含业务单、对账批次）
+python3 tests/test_e2e.py        # 或 make test —— 对运行中的栈做端到端断言（含业务单、对账批次、关窗宽限）
 python3 tests/test_core.py       # 或 make unit —— 纯逻辑单测，无需任何依赖
 ```
 
@@ -392,7 +438,9 @@ REDRIVE / MARK_DELIVERED / NONE：落后认了钉在报到版、驳了接着送�
 | `GET /audit?window_start=&key=` | 全局审计流（INITIAL / LATE_EVENT / RETRACTION） |
 | `GET /watermarks` | 两边当前水位、来源（`event_time` / `idle_timeout` / `override` / `no_data`）与 `min_watermark` |
 | `GET /watermarks/history?stream=` | 水位变更历史，含 `advance` / `regress` 方向 |
-| `GET /windows` | 所有已知 (窗口, key) 的状态：是否关窗、head 版本、事件数 |
+| `GET /windows` | 所有已知 (窗口, key) 的状态：是否关窗、head 版本、事件数；宽限中的窗另带 `grace_active`/`grace_due_at`/`grace_id` 与 `closed_effective` |
+| `POST /window-graces` | 给**还没出过结果**的一键一窗点关窗宽限：`{"window_start", "key", "extra_ms", "operator"?, "note"?}`；宽限期内不出 INITIAL，到点按当时版本出（仍一边就单边出），全撤空则 `EXPIRED`；已出过结果/已有 ACTIVE 宽限 `409`、无有效数据 `404`、窗起点不对齐 `422` |
+| `GET /window-graces?key=&window_start=&status=&active_only=` | 宽限台账：哪些窗正在宽、什么时候到期（`due_at`）、哪一键；`FIRED`（含 `fired_version`）/`EXPIRED` 历史只增保留 |
 | `GET /orders?status=&key=` | 业务单当前状态（`OPEN`/`WAITING`/`CLOSED`/`REOPENED`/`VOID`）及各窗统计；`CLOSED` 即成功单 |
 | `GET /orders/current?key=` | 一张单的当前态：各窗进单时绑定的结果版本、还缺/在等的窗 |
 | `GET /orders/history?key=` | 一张单的全部整单版本：为什么被重开/作废、哪窗哪版触发、当时各窗版本快照 |

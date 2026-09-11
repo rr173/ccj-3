@@ -6,11 +6,12 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "services", "aligner"))
 
 from app.core import (compute_payload, decide, delivery_kind, effective,  # noqa: E402
-                      normalize_backfill_range, payload_hash,
-                      posting_gate_allows, posting_status,
+                      grace_fate, grace_grant_error, normalize_backfill_range,
+                      payload_hash, posting_gate_allows, posting_status,
                       released_version_kind, releasable,
                       reportable_delivery_status, retry_delay_ms,
-                      should_deliver, side_evidence, window_of, window_ready)
+                      should_deliver, side_evidence, valid_window_start,
+                      window_of, window_ready)
 
 W = 30_000
 
@@ -382,6 +383,57 @@ class TestNormalizeBackfillRange(unittest.TestCase):
         self.assertLessEqual(from_ws, 123_456)
         self.assertGreaterEqual(to_ws, 234_567)
         self.assertLess(from_ws, to_ws)
+
+
+class TestCloseGrace(unittest.TestCase):
+    """Per-(window, key) close grace: hold one un-emitted window past its end,
+    fire the then-current version at the deadline (one-sided included), lapse
+    when nothing remains; emitted windows and stacked ACTIVE graces rejected."""
+
+    def test_window_start_must_be_a_boundary(self):
+        self.assertTrue(valid_window_start(0, W))
+        self.assertTrue(valid_window_start(3 * W, W))
+        self.assertFalse(valid_window_start(W - 1, W))
+        self.assertFalse(valid_window_start(W + 1, W))
+        self.assertFalse(valid_window_start(-W, W))
+
+    def test_grant_allowed_only_for_unemitted_data_window(self):
+        # data present, no head, no grace: allowed
+        self.assertIsNone(grace_grant_error(True, False, False))
+        # no effective data: nothing to wait for
+        self.assertEqual(grace_grant_error(False, False, False),
+                         "window_not_active")
+        # already produced a result (even a RETRACTED head): never graced again
+        self.assertEqual(grace_grant_error(True, True, False),
+                         "already_emitted")
+        self.assertEqual(grace_grant_error(False, True, False),
+                         "already_emitted")
+        # an ACTIVE grace already holds it: no stacking (data necessarily
+        # exists — a grant required it — so the active check is what bites)
+        self.assertEqual(grace_grant_error(True, False, True),
+                         "active_grace_exists")
+
+    def test_hold_until_deadline_even_if_both_sides_crossed(self):
+        # deadline in the future: HOLD regardless of data readiness
+        self.assertEqual(grace_fate("ACTIVE", 10_000, 9_999, True), "HOLD")
+        self.assertEqual(grace_fate("ACTIVE", 10_000, 0, True), "HOLD")
+
+    def test_fire_at_deadline_with_data_one_sided_included(self):
+        # at/after the deadline with data left: FIRE, even one-sided —
+        # no waiting past the deadline
+        self.assertEqual(grace_fate("ACTIVE", 10_000, 10_000, True), "FIRE")
+        self.assertEqual(grace_fate("ACTIVE", 10_000, 20_000, True), "FIRE")
+
+    def test_expire_at_deadline_when_everything_was_retracted(self):
+        self.assertEqual(grace_fate("ACTIVE", 10_000, 10_000, False),
+                         "EXPIRE")
+
+    def test_terminal_graces_are_inert(self):
+        # FIRED/EXPIRED rows never drive the sweeper again
+        self.assertIsNone(grace_fate("FIRED", 1, 2, True))
+        self.assertIsNone(grace_fate("EXPIRED", 1, 2, True))
+        # an expired-without-data window is grantable again once data returns
+        self.assertIsNone(grace_grant_error(True, False, False))
 
 
 if __name__ == "__main__":

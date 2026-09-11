@@ -512,6 +512,81 @@ def window_ready(mark_a, mark_b, window_end):
 
 
 # ---------------------------------------------------------------------------
+# Per-(window, key) close grace (关窗宽限).
+#
+# A not-yet-emitted (window, key) can be granted ONE active grace extension:
+# hold its INITIAL result past the ordinary per-key window end and wait a
+# little longer for the opposite side. The scope is exactly that one pair —
+# every other key and window keeps closing at its own window end, never held
+# up by it. While the grace is active the window simply does not emit, even if
+# both sides have already crossed; at the wall-clock deadline the version as
+# it stands THEN is emitted, one side included ("到点了还是一边，按单边出，
+# 不能再空等"). Late events / retractions landing during the grace keep
+# changing the internal computation exactly as usual, so the deadline emits
+# the then-current recomputation. A window whose data is all retracted before
+# the deadline has nothing to emit: the grace expires and the window returns
+# to ordinary per-key waiting. A window that already produced a result can
+# never be graced again, and two not-yet-due graces cannot stack on one
+# window (the ACTIVE row is unique per (window, key)).
+# ---------------------------------------------------------------------------
+
+GRACE_STATUSES = ("ACTIVE", "FIRED", "EXPIRED")
+
+# Grace grants above this are almost certainly a caller mistake, not a real
+# "wait a little longer for the other side" request (30 days).
+MAX_GRACE_EXTRA_MS = 30 * 24 * 3600 * 1000
+
+
+def valid_window_start(window_start, window_size_ms):
+    """A grant must name a tumbling-window boundary, not a time inside one."""
+    return window_start >= 0 and window_size_ms > 0 \
+        and window_start % window_size_ms == 0
+
+
+def grace_grant_error(has_effective_data, head_exists, has_active_grace):
+    """Whether a (window, key) may receive a grace now.
+
+    Returns None when allowed, otherwise a machine-readable reason:
+
+    - ``already_emitted``    — the window already produced a result (a later
+                               RETRACTED head included — what went out is a
+                               fact, corrections are its only path); this
+                               takes precedence over the data check, since a
+                               fully retracted head is still a past result;
+    - ``window_not_active``  — no effective (non-retracted) data in the window
+                               yet: there is nothing to hold/wait for;
+    - ``active_grace_exists``— one not-yet-due grace already holds it.
+    """
+    if head_exists:
+        return "already_emitted"
+    if not has_effective_data:
+        return "window_not_active"
+    if has_active_grace:
+        return "active_grace_exists"
+    return None
+
+
+def grace_fate(status, deadline_ms, now_ms, has_effective_data):
+    """Fate of a grace row on a tick.
+
+    Returns None for a non-ACTIVE row; otherwise:
+
+    - ``HOLD``   — deadline still ahead: the window must not emit yet, even if
+                   both sides have already crossed the window end;
+    - ``FIRE``   — deadline reached and effective data remains: emit the
+                   then-current version, one-sided included;
+    - ``EXPIRE`` — deadline reached with no effective data left (everything
+                   was retracted): nothing to emit, the grace lapses and the
+                   window goes back to ordinary per-key waiting.
+    """
+    if status != "ACTIVE":
+        return None
+    if now_ms < deadline_ms:
+        return "HOLD"
+    return "FIRE" if has_effective_data else "EXPIRE"
+
+
+# ---------------------------------------------------------------------------
 # business orders (业务单): one order per business key, assembled from the
 # aligned window results. Pure state machine — the service layer supplies the
 # current bindings and the window-gaps view, this decides the order's status.

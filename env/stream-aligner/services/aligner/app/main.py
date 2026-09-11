@@ -14,6 +14,24 @@ overwritten, and a watermark regression can never un-emit them. All
 recomputation is idempotent: identical content never yields a new version, so
 replays and restarts cannot double-count.
 
+A per-(window, key) close grace (关窗宽限, POST /window-graces) lets an
+operator hold ONE not-yet-emitted window of ONE business key for an extra
+wall-clock interval to wait for its opposite side: while the grace is ACTIVE
+that pair's INITIAL result is withheld even after both of that key's sides
+cross the window end, while every other key and every other window of the same
+key keeps its original window end — the scope is exactly the one pair, and one
+pair's wait can never hold another pair back. Two ACTIVE graces cannot stack
+on a window and a window that already emitted can never be graced again (the
+grant fails 409 in both cases; ACTIVE uniqueness is also a partial index).
+At the deadline the deadline sweeper (the first step of the same per-tick
+close pass) emits the THEN-current recomputation in one transaction with the
+grace row's FIRED marker: a late opposite-side event arriving during the wait
+is folded into that very first version, and a window still one-sided at the
+deadline fires one-sided rather than waiting forever; if all data was
+retracted away meanwhile the grace lapses (EXPIRED) without a result and
+ordinary per-key waiting resumes. Grace rows are append-only and queryable
+via GET /window-graces (which windows are held, their due_at, which key).
+
 Computed results are internal until *externally released* (对外放行): a
 per-business-key gate (closed by default) holds fresh windows back — versions,
 audit and order folds still happen and remain queryable, but no delivery rows
@@ -105,14 +123,15 @@ import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app.core import (ORDER_STATUSES, POSTING_STATUSES, build_order_snapshot,
+from app.core import (MAX_GRACE_EXTRA_MS, ORDER_STATUSES, POSTING_STATUSES,
+                      build_order_snapshot,
                       compute_payload, decide, delivery_kind, evaluate_order,
-                      normalize_backfill_range, order_reason, posting_status,
-                      ranges_overlap, reconciliation_can_close,
+                      grace_grant_error, normalize_backfill_range, order_reason,
+                      posting_status, ranges_overlap, reconciliation_can_close,
                       reconciliation_item_status, released_version_kind,
                       retry_delay_ms, settlement_blocks_report, settlement_effect,
-                      settlement_fulfils, settlement_pin_version,
-                      should_deliver, side_evidence, window_of, window_ready)
+                      settlement_fulfils, settlement_pin_version, should_deliver,
+                      side_evidence, valid_window_start, window_of, window_ready)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -590,6 +609,41 @@ CREATE INDEX IF NOT EXISTS reconciliation_settlements_batch_idx
 CREATE INDEX IF NOT EXISTS reconciliation_settlements_active_idx
     ON reconciliation_settlements (subscriber_id, window_start, key)
     WHERE status = 'ACTIVE';
+-- ---------------------------------------------------------------------------
+-- Per-(window, key) close grace (关窗宽限).
+--
+-- A not-yet-emitted (window, key) may be granted one ACTIVE grace: hold its
+-- INITIAL result past the ordinary per-key window end and wait a little
+-- longer for the opposite side. Rows are append-only — a granted grace is
+-- never deleted. ACTIVE = still holding (due_at is the wall-clock deadline);
+-- FIRED = the deadline elapsed with effective data left, the then-current
+-- version was emitted in the same transaction that flipped it; EXPIRED = the
+-- deadline elapsed after all data was retracted away, nothing was emitted and
+-- the window went back to ordinary waiting (a fresh grace may be granted
+-- later once new data arrives). The partial unique index makes "同一窗不能
+-- 叠两条还没到期的宽限" a database-level guarantee under concurrent grants.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS window_graces (
+    id             BIGSERIAL PRIMARY KEY,
+    window_start   BIGINT NOT NULL,
+    window_end     BIGINT NOT NULL,
+    key            TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'ACTIVE'
+                   CHECK (status IN ('ACTIVE', 'FIRED', 'EXPIRED')),
+    extra_ms       BIGINT NOT NULL,
+    due_at         TIMESTAMPTZ NOT NULL,
+    fired_version  INT,                 -- version emitted at the deadline (FIRED)
+    created_by     TEXT,
+    note           TEXT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at    TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS window_graces_one_active_uq
+    ON window_graces (window_start, key) WHERE status = 'ACTIVE';
+CREATE INDEX IF NOT EXISTS window_graces_active_due_idx
+    ON window_graces (due_at) WHERE status = 'ACTIVE';
+CREATE INDEX IF NOT EXISTS window_graces_key_idx
+    ON window_graces (key, window_start);
 """
 
 
@@ -659,7 +713,7 @@ def build_payload(cur, window_start, key):
     return compute_payload(key, window_start, window_end, by_stream["a"], by_stream["b"])
 
 
-def emit(conn, window_start, key, reason, detail):
+def emit(conn, window_start, key, reason, detail, grace=None):
     """Recompute (window, key) and persist a new version iff the content changed.
 
     The version row and its audit entry are always written: the internal
@@ -676,14 +730,25 @@ def emit(conn, window_start, key, reason, detail):
       deliveries exist until an explicit release (or a later gate open) takes
       the then-current head.
 
+    A per-(window, key) close grace (关窗宽限) additionally holds the FIRST
+    version: while an ACTIVE grace exists, an INITIAL emission is skipped even
+    if both sides crossed the window end ("宽限没到点，这一窗就先别出"). The
+    deadline sweeper calls this function with ``grace`` (the ACTIVE row locked
+    FOR UPDATE): the row is re-checked under the key gate lock and the fate is
+    committed in the same transaction as the version — FIRED with the
+    then-current version (one-sided included, "到点了还是一边，按单边出"), or
+    EXPIRED without a version when the recomputation is empty (everything was
+    retracted during the wait).
+
     Everything above commits in one transaction, so a delivered version can
-    never be missing its release record, and a held version can never leak an
-    outbox row.
+    never be missing its release record, a FIRED grace can never exist without
+    its version, and a held version can never leak an outbox row.
     """
     window_end = window_start + WINDOW_MS
     with conn, conn.cursor() as cur:
-        # Serialize against a concurrent explicit release / gate flip for the
-        # same key: both paths take the gate row lock first.
+        # Serialize against a concurrent explicit release / gate flip / grace
+        # grant for the same key: every writing path takes the gate row lock
+        # first, then (if it touches one) the grace row lock.
         cur.execute(
             """INSERT INTO release_gates (key) VALUES (%s) ON CONFLICT (key) DO NOTHING""",
             (key,),
@@ -691,9 +756,62 @@ def emit(conn, window_start, key, reason, detail):
         cur.execute("SELECT open FROM release_gates WHERE key = %s FOR UPDATE", (key,))
         gate_open = cur.fetchone()[0]
 
+        if grace is not None:
+            # Deadline sweeper path: pin the grace row and re-validate it
+            # under the gate lock. The sweeper selected due ACTIVE rows
+            # before taking this lock, so the row must still be exactly that.
+            cur.execute(
+                """SELECT id, status, due_at FROM window_graces
+                   WHERE id = %s AND window_start = %s AND key = %s FOR UPDATE""",
+                (grace["id"], window_start, key),
+            )
+            locked = cur.fetchone()
+            if locked is None or locked[1] != "ACTIVE":
+                log.warning("grace %s for window=%d key=%s changed before firing; skipping",
+                            grace["id"], window_start, key)
+                return False
+        else:
+            # Ordinary path: an ACTIVE grace holds the first version of this
+            # window regardless of the crossing evidence ("只宽这一键这一窗"
+            # — the hold itself is the grace's whole effect; other windows
+            # are simply not listed here).
+            cur.execute(
+                "SELECT 1 FROM window_graces WHERE window_start = %s AND key = %s "
+                "AND status = 'ACTIVE' LIMIT 1",
+                (window_start, key),
+            )
+            if cur.fetchone() is not None:
+                log.info("window=%d key=%s HELD by active close grace (not emitted yet)",
+                         window_start, key)
+                return False
+
         payload = build_payload(cur, window_start, key)
         head = get_head(cur, window_start, key)
         nxt = decide(head, payload)
+
+        if grace is not None:
+            # The deadline is here: an empty recomputation (all events
+            # retracted during the wait) emits nothing — the grace lapses and
+            # the window returns to ordinary per-key waiting; a fresh grace
+            # can be granted once new data arrives.
+            if nxt is None:
+                if payload is None and head is None:
+                    cur.execute(
+                        """UPDATE window_graces
+                           SET status = 'EXPIRED', finished_at = now()
+                           WHERE id = %s AND status = 'ACTIVE'""",
+                        (grace["id"],),
+                    )
+                    log.info("window=%d key=%s grace %s EXPIRED with no data left",
+                             window_start, key, grace["id"])
+                    return False
+                # A non-initial no-op at the deadline means another path
+                # already produced identical content under the same gate
+                # lock — it owns the FIRE transition; do nothing.
+                log.warning("window=%d key=%s grace %s due but recompute is a no-op "
+                            "(head=%s)", window_start, key, grace["id"], head)
+                return False
+
         if nxt is None:
             return False
         if head is not None:
@@ -713,6 +831,24 @@ def emit(conn, window_start, key, reason, detail):
              head["version"] if head else None, nxt["version"], reason,
              psycopg2.extras.Json(detail) if detail is not None else None),
         )
+        if grace is not None:
+            # The deadline elapsed: the version just committed is exactly the
+            # then-current recomputation ("到期出的就是当时那一版"). Mark the
+            # grace FIRED right here — before the external-release decision —
+            # because grace concerns the INTERNAL emission: a version held by
+            # the (orthogonal) release gate still closes the grace, otherwise
+            # the sweeper would keep re-selecting this ACTIVE row forever.
+            # Same transaction either way, so a crash leaves neither a version
+            # without a FIRED row nor a FIRED row without its version.
+            cur.execute(
+                """UPDATE window_graces
+                   SET status = 'FIRED', fired_version = %s, finished_at = now()
+                   WHERE id = %s AND status = 'ACTIVE'""",
+                (nxt["version"], grace["id"]),
+            )
+            if cur.rowcount == 0:
+                raise RuntimeError(
+                    f"grace {grace['id']} vanished during FIRE for window={window_start} key={key}")
         cur.execute(
             "SELECT 1 FROM window_releases WHERE window_start = %s AND key = %s",
             (window_start, key),
@@ -754,8 +890,8 @@ def emit(conn, window_start, key, reason, detail):
             (window_start, window_end, key, nxt["version"], kind,
              psycopg2.extras.Json(payload) if payload is not None else None),
         )
-    log.info("window=%d key=%s -> v%d (%s, %s)", window_start, key, nxt["version"],
-             nxt["status"], reason)
+    log.info("window=%d key=%s -> v%d (%s, %s)%s", window_start, key, nxt["version"],
+             nxt["status"], reason, " [grace FIRED]" if grace is not None else "")
     return True
 
 
@@ -912,6 +1048,23 @@ def emission_marks(wms, key_max, sides, key, ws):
     return marks
 
 
+def due_graces(cur):
+    """ACTIVE close graces whose wall-clock deadline has elapsed, oldest first."""
+    cur.execute(
+        """SELECT id, window_start, window_end, key, extra_ms
+           FROM window_graces
+           WHERE status = 'ACTIVE' AND due_at <= now()
+           ORDER BY due_at, id""")
+    return [{"id": r[0], "window_start": r[1], "window_end": r[2],
+             "key": r[3], "extra_ms": r[4]} for r in cur.fetchall()]
+
+
+def active_grace_pairs(cur):
+    """The {(window_start, key)} set currently held by an ACTIVE close grace."""
+    cur.execute("SELECT window_start, key FROM window_graces WHERE status = 'ACTIVE'")
+    return {(r[0], r[1]) for r in cur.fetchall()}
+
+
 def close_windows(conn):
     """Emit INITIAL results for (window, key) pairs whose own two sides have
     both crossed the window end.
@@ -924,12 +1077,39 @@ def close_windows(conn):
     have arrived is finalized once the streams go idle. Already-emitted
     results are never revisited here, so a watermark regression cannot
     un-emit them.
+
+    A per-(window, key) close grace (关窗宽限) changes exactly one pair's
+    timing: while ACTIVE its INITIAL is held even after both sides crossed;
+    due graces are swept FIRST here, and emit() publishes the then-current
+    recomputation at the deadline regardless of crossing evidence — still
+    one-sided, it goes out one-sided ("到点了还是一边，按单边出"), or the
+    grace lapses (EXPIRED) if all its data was retracted away. Every other
+    (window, key) keeps its ordinary window end and is merely skipped while
+    its own grace is active — other keys are never blocked by it.
     """
     with conn.cursor() as cur:
         wms = current_watermarks(cur)
         key_max = key_max_event_times(cur)
         sides = effective_data_sides(cur)
+        due = due_graces(cur)
+        held = active_grace_pairs(cur)
+    for g in due:
+        key, ws = g["key"], g["window_start"]
+        end = ws + WINDOW_MS
+        marks = emission_marks(wms, key_max, sides, key, ws)
+        # The deadline, not the crossing evidence, decides now: emit takes
+        # the ACTIVE row FOR UPDATE and flips it FIRED/EXPIRED atomically.
+        emit(conn, ws, key, "INITIAL", {
+            "grace": {"id": g["id"], "extra_ms": g["extra_ms"], "fired_at_deadline": True},
+            "side_a": side_evidence(marks["a"], end),
+            "side_b": side_evidence(marks["b"], end),
+            "watermark_a": marks["a"]["watermark"],
+            "watermark_b": marks["b"]["watermark"],
+        }, grace=g)
+        held.discard((ws, key))
     for key, ws in sides:
+        if (ws, key) in held:
+            continue  # an active grace holds exactly this one pair
         end = ws + WINDOW_MS
         marks = emission_marks(wms, key_max, sides, key, ws)
         if not window_ready(marks["a"], marks["b"], end):
@@ -976,12 +1156,19 @@ def business_windows(cur, key):
 def order_window_gaps(cur, key, bound):
     """Unbound business windows, split into missing (both sides crossed, so
     the result is due) and pending (still waiting for at least one side) —
-    the same per-key gate that drives emission."""
+    the same per-key gate that drives emission. A window held by an ACTIVE
+    close grace counts as pending: it deliberately waits past the window end
+    for the other side and must not read as a missing result to the order;
+    the deadline sweep emits it before orders are built on the same tick."""
     wms = current_watermarks(cur)
     key_max = key_max_event_times(cur, key)
     sides = effective_data_sides(cur, key)
+    graced = active_grace_pairs(cur)
     missing, pending = [], []
     for ws in business_windows(cur, key) - bound:
+        if (ws, key) in graced:
+            pending.append(ws)
+            continue
         marks = emission_marks(wms, key_max, sides, key, ws)
         due = window_ready(marks["a"], marks["b"], ws + WINDOW_MS)
         (missing if due else pending).append(ws)
@@ -1267,6 +1454,87 @@ def set_gate(conn, key, open_):
     log.info("gate key=%s -> %s (flushed %d held windows)", key,
              "OPEN" if open_ else "CLOSED", len(released))
     return released
+
+
+# ---------------------------------------------------------------------------
+# per-(window, key) close grace (关窗宽限)
+# ---------------------------------------------------------------------------
+# One operational extension of a single not-yet-emitted (window, key): hold its
+# INITIAL result extra_ms past the ordinary per-key window end and wait for the
+# opposite side. The scope is exactly that pair — other keys and this key's
+# other windows keep their original window ends, and nothing is blocked on
+# them. Rules enforced here, all under the key's gate-row lock (taken before
+# every grace-row lock, the same order emit()/the deadline sweep use):
+#
+# - the window must hold effective data and must not have emitted yet
+#   ("已经出过结果的窗不能再宽，再点要失败");
+# - at most one ACTIVE grace per (window, key)
+#   ("同一窗不能叠两条还没到期的宽限" — also a partial unique index);
+# - granting never publishes anything; the deadline sweeper in close_windows
+#   emits the then-current version (one-sided included) or lapses the grace
+#   when the data is gone.
+# Grace rows are append-only: FIRED/EXPIRED history stays queryable.
+
+def grant_window_grace(conn, window_start, key, extra_ms, created_by=None, note=None):
+    """Grant one ACTIVE close grace to a single (window, key).
+
+    Returns the new grace row (RealDict) or raises HTTPException: 404 when the
+    window has no effective data yet (nothing to wait for), 409 when the
+    window already emitted a result or already has an ACTIVE grace.
+    """
+    window_end = window_start + WINDOW_MS
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        # Same lock order as emit(): gate row first, grace rows second.
+        cur.execute(
+            "INSERT INTO release_gates (key) VALUES (%s) ON CONFLICT (key) DO NOTHING",
+            (key,),
+        )
+        cur.execute("SELECT 1 FROM release_gates WHERE key = %s FOR UPDATE", (key,))
+        cur.fetchone()
+        # Lock the pair's grace history so two concurrent grants cannot both
+        # pass the ACTIVE check (the partial unique index is the hard backstop).
+        cur.execute(
+            """SELECT id, status FROM window_graces
+               WHERE window_start = %s AND key = %s
+               ORDER BY id FOR UPDATE""",
+            (window_start, key),
+        )
+        grace_rows = cur.fetchall()
+        if any(r["status"] == "ACTIVE" for r in grace_rows):
+            active = next(r for r in grace_rows if r["status"] == "ACTIVE")
+            raise HTTPException(
+                409,
+                f"window {window_start} of key {key!r} already has ACTIVE grace "
+                f"{active['id']} that has not come due (同一窗不能叠两条还没到期的宽限)")
+        head = get_head(cur, window_start, key)
+        has_data = (key, window_start) in effective_data_sides(cur, key)
+        # The ACTIVE check was already done above under the row locks (plus a
+        # partial unique index backstops concurrent grants); here only the
+        # data/result preconditions remain.
+        err = grace_grant_error(has_data, head is not None, False)
+        if err == "already_emitted":
+            raise HTTPException(
+                409,
+                f"window {window_start} of key {key!r} already produced result v"
+                f"{head['version']} ({head['status']}) — emitted windows cannot be "
+                "graced again (已经出过结果的窗不能再宽)")
+        if err == "window_not_active":
+            raise HTTPException(
+                404,
+                f"window {window_start} of key {key!r} has no effective data yet — "
+                "nothing to hold; send its events first")
+        cur.execute(
+            """INSERT INTO window_graces
+                   (window_start, window_end, key, extra_ms, due_at, created_by, note)
+               VALUES (%s, %s, %s, %s,
+                       now() + %s * INTERVAL '1 millisecond', %s, %s)
+               RETURNING *""",
+            (window_start, window_end, key, extra_ms, extra_ms, created_by, note),
+        )
+        row = cur.fetchone()
+    log.info("close grace %s granted to window=%d key=%s extra=%dms due=%s",
+             row["id"], window_start, key, extra_ms, row["due_at"])
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -2684,6 +2952,12 @@ def windows():
                 heads = {(r["window_start"], r["key"]): r for r in cur.fetchall()}
                 cur.execute("SELECT key, open FROM release_gates")
                 gates = {r[0]: r[1] for r in cur.fetchall()}
+                cur.execute(
+                    """SELECT window_start, key, id, due_at, extra_ms, created_at
+                       FROM window_graces WHERE status = 'ACTIVE'""")
+                graces = {(r[0], r[1]): {"id": r[2], "due_at": r[3],
+                                         "extra_ms": r[4], "created_at": r[5]}
+                          for r in cur.fetchall()}
     finally:
         conn.close()
     values = [i["watermark"] for i in wms.values()]
@@ -2694,17 +2968,27 @@ def windows():
         ws = r["window_start"]
         marks = emission_marks(wms, key_max, sides, r["key"], ws)
         head = heads.get((ws, r["key"]))
+        grace = graces.get((ws, r["key"]))
+        crossed = window_ready(marks["a"], marks["b"], ws + WINDOW_MS)
         out.append({
             "window_start": ws,
             "window_end": ws + WINDOW_MS,
             "key": r["key"],
             "upserts": r["upserts"],
             "retracts": r["retracts"],
-            "closed": window_ready(marks["a"], marks["b"], ws + WINDOW_MS),
+            "closed": crossed,
+            # An ACTIVE close grace deliberately keeps an otherwise crossed
+            # window unemitted until due_at; that is the only state in which
+            # `closed` is true but no head version exists.
+            "closed_effective": crossed and grace is None,
             "head_version": head["version"] if head else None,
             "head_status": head["status"] if head else None,
             "released": bool(head and head["released"]),
             "gate_open": gates.get(r["key"], False),
+            "grace_active": grace is not None,
+            "grace_due_at": grace["due_at"] if grace else None,
+            "grace_extra_ms": grace["extra_ms"] if grace else None,
+            "grace_id": grace["id"] if grace else None,
         })
     return {"windows": out, "min_watermark": min_wm}
 
@@ -2955,6 +3239,102 @@ def release_history(key: str, limit: int = Query(default=100)):
     finally:
         conn.close()
     return {"key": key, "actions": actions, "released_windows": ledger}
+
+
+# ---------------------------------------------------------------------------
+# per-(window, key) close grace (关窗宽限)
+# ---------------------------------------------------------------------------
+
+class GraceIn(BaseModel):
+    window_start: int = Field(
+        ge=0,
+        description="start of the window to hold; must be a tumbling-window boundary")
+    key: str = Field(min_length=1, max_length=200)
+    extra_ms: int = Field(
+        gt=0,
+        description="extra wall-clock time to wait for the opposite side past "
+                    "the deadline tick; the window fires at now()+extra_ms")
+    operator: Optional[str] = Field(default=None, max_length=200)
+    note: Optional[str] = Field(default=None, max_length=2000)
+
+
+@app.post("/window-graces", status_code=201)
+def window_grace_grant(body: GraceIn):
+    """Grant one close grace to a single not-yet-emitted (window, key).
+
+    The window keeps computing internally but its INITIAL result is held for
+    ``extra_ms`` of wall-clock time even after both of that key's sides cross
+    the window end — other keys and this key's other windows keep their
+    original window ends and are never held up by it. At the deadline the
+    then-current version is emitted: still one-sided, it goes out one-sided
+    (the wait never continues past the deadline); if every event was
+    retracted away meanwhile, the grace lapses (EXPIRED) without a result and
+    ordinary waiting resumes. A window that already produced a result, or one
+    that already has an ACTIVE grace, cannot be granted another one (409); a
+    window with no effective data yet is 404; ``window_start`` must be a
+    window boundary (422).
+    """
+    if not valid_window_start(body.window_start, WINDOW_MS):
+        raise HTTPException(
+            422, f"window_start {body.window_start} is not a window boundary "
+                 f"(window size {WINDOW_MS}ms)")
+    if body.extra_ms > MAX_GRACE_EXTRA_MS:
+        raise HTTPException(
+            422, f"extra_ms must be <= {MAX_GRACE_EXTRA_MS} (30 days)")
+    conn = connect()
+    try:
+        try:
+            row = grant_window_grace(conn, body.window_start, body.key,
+                                     body.extra_ms, body.operator, body.note)
+        except psycopg2.errors.UniqueViolation:
+            raise HTTPException(
+                409, "an ACTIVE close grace for this (window, key) already exists")
+    finally:
+        conn.close()
+    return {"grace": row}
+
+
+@app.get("/window-graces")
+def window_graces(window_start: Optional[int] = None, key: Optional[str] = None,
+                  status: Optional[str] = None, active_only: bool = False,
+                  limit: int = Query(default=500)):
+    """Close-grace ledger — which windows are currently held, when their
+    deadline is, and for which business key.
+
+    Rows are append-only: ACTIVE (still holding; ``due_at`` is the wall-clock
+    deadline), FIRED (the deadline elapsed with data left — ``fired_version``
+    is the version that went out then), EXPIRED (the deadline elapsed after
+    all data was retracted away — nothing emitted, the window is back to
+    ordinary waiting and may be graced again once data returns). Filters:
+    key / window_start / status / active_only; newest grants first.
+    """
+    if status is not None and status not in ("ACTIVE", "FIRED", "EXPIRED"):
+        raise HTTPException(422, "status must be ACTIVE, FIRED or EXPIRED")
+    conds, args = [], []
+    if window_start is not None:
+        conds.append("window_start = %s")
+        args.append(window_start)
+    if key is not None:
+        conds.append("key = %s")
+        args.append(key)
+    if status is not None:
+        conds.append("status = %s")
+        args.append(status)
+    if active_only:
+        conds.append("status = 'ACTIVE'")
+    sql = "SELECT * FROM window_graces"
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY id DESC LIMIT %s"
+    args.append(min(max(limit, 1), 5000))
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, args)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {"graces": rows, "count": len(rows)}
 
 
 # ---------------------------------------------------------------------------
