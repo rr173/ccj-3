@@ -349,6 +349,53 @@ def main():
         check("the dead carry never matches in the later target",
               not tagged and tv2["payload"]["match_count"] == 1, str(tv2["payload"]))
 
+    # ------------------------------------------------------------------
+    # 8. B-side carry regression: the carried events are B leftovers. This is
+    #    the exact failure reported (carry stays OPEN, empty matched_snapshot,
+    #    item ids wrong): it must close with a non-empty snapshot carrying the
+    #    real submitted event ids on BOTH sides of the pair.
+    ws3 = ws + 8 * W
+    tgt3 = ws3 + W
+    k3 = f"{key}-b{now}"
+    # source closes B-long: b1 pairs a1, b2 is the B leftover
+    post(A, "/events", ev(f"{k3}-a1", ws3 + 1000, k3))
+    post(B, "/events", {"events": [ev(f"{k3}-b1", ws3 + 1500, k3),
+                                   ev(f"{k3}-b2", ws3 + 2500, k3)]})
+    s3 = wait_head(ws3, k3)
+    check("b-side source has one B leftover to carry",
+          s3 and s3["payload"]["unmatched_b"] == [f"{k3}-b2"], str(s3))
+    code, c3resp = post(R, "/gap-carries",
+                        {"key": k3, "source_window_start": ws3,
+                         "target_window_start": tgt3, "side": "b"})
+    check("b-side carry opens (201)", code == 201, str(c3resp))
+    c3 = c3resp["carry"]["id"]
+    check("the OPEN carry already carries the real submitted event id",
+          [i["event_id"] for i in c3resp["carry"]["items"]] == [f"{k3}-b2"],
+          str(c3resp["carry"]))
+    # target closes A-long: native a4-b3, the carried b2 fills the A leftover a5
+    post(A, "/events", {"events": [ev(f"{k3}-a4", tgt3 + 1000, k3),
+                                   ev(f"{k3}-a5", tgt3 + 2500, k3)]})
+    post(B, "/events", ev(f"{k3}-b3", tgt3 + 1500, k3))
+    tv3 = wait_head(tgt3, k3)
+    tagged3 = wait_for("b-side carry pair appears in the target",
+                       lambda: [p for p in head(tgt3, k3)["payload"]["pairs"]
+                                if p.get("carry")
+                                and p["carry"]["carry_id"] == c3] or None)
+    if tv3 and tagged3:
+        check("b-side carry pairs the real carried B id against the A leftover",
+              [(p["a_event_id"], p["b_event_id"]) for p in tagged3]
+              == [(f"{k3}-a5", f"{k3}-b2")]
+              and tagged3[0]["carry"]["source_window_start"] == ws3, str(tagged3))
+    c3f = wait_status(c3, "CLOSED")
+    if c3f:
+        check("b-side carry CLOSED with a NON-EMPTY snapshot of real ids",
+              c3f["target_version"] is not None
+              and c3f["matched_snapshot"] is not None
+              and c3f["matched_snapshot"]["matches"]
+              == [{"event_id": f"{k3}-b2", "matched_against": f"{k3}-a5"}]
+              and c3f["items"][0]["matched_against"] == f"{k3}-a5",
+              str(c3f))
+
     print()
     if FAILED:
         print(f"{len(FAILED)} check(s) FAILED: {FAILED}")

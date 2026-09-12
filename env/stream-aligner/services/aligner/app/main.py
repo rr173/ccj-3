@@ -821,6 +821,22 @@ def get_head(cur, window_start, key):
     return {"id": row[0], "version": row[1], "status": row[2], "payload_hash": row[3]} if row else None
 
 
+def get_head_full(cur, window_start, key):
+    """Like get_head, but also carries the stored payload (needed by carry
+    derivation, which reads the target result's pairs). get_head stays lean —
+    most callers never need the payload blob."""
+    cur.execute(
+        """SELECT id, version, status, payload_hash, payload FROM results
+           WHERE window_start = %s AND key = %s ORDER BY version DESC LIMIT 1""",
+        (window_start, key),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "version": row[1], "status": row[2],
+            "payload_hash": row[3], "payload": row[4]}
+
+
 def load_effective_events(cur, window_start, key):
     """Effective (non-retracted) upserts of (window, key), per stream.
 
@@ -1866,7 +1882,7 @@ def derive_carries(conn):
             cur.execute("SELECT status, target_version FROM gap_carries WHERE id = %s FOR UPDATE",
                         (cid,))
             status, closed_version = cur.fetchone()
-            head = get_head(cur, tws, key)
+            head = get_head_full(cur, tws, key)
             payload = head["payload"] if head and head["status"] != "RETRACTED" else None
             cur.execute(
                 """SELECT event_id, item_status, matched_version, matched_against
