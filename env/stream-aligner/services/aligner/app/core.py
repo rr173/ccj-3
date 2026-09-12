@@ -600,7 +600,7 @@ ORDER_REASONS = ("ORDER_OPENED", "WINDOW_JOINED", "WINDOW_CORRECTED",
 
 
 def evaluate_order(bindings, missing, pending, ever_closed, reason,
-                   open_carry_count=0, open_migration_count=0):
+                   open_carry_count=0, open_migration_count=0, prev_status=None):
     """Decide an order's status from its current window bindings.
 
     ``bindings``    — one dict per bound window: {"result_status", "has_gap"}.
@@ -617,6 +617,10 @@ def evaluate_order(bindings, missing, pending, ever_closed, reason,
                       have not cut yet (OPEN; a REOPENED cut already routed its
                       tail away and does not block): the key's order cannot
                       reach CLOSED while its tail is held for a pending cut.
+    ``prev_status`` — the order's status on the immediately previous version.
+                      When None it falls back to the ever_closed flag (the
+                      pre-existing two-argument callers treat any previously
+                      closed order as coming from CLOSED).
 
     CLOSE requires all of: at least one live window; every known business
     window bound (nothing missing or pending); no withdrawn window left
@@ -626,22 +630,28 @@ def evaluate_order(bindings, missing, pending, ever_closed, reason,
     excluded by the caller), so it neither blocks nor closes here. All windows
     withdrawn -> VOID (the business is gone, not a success).
 
-    A correction or withdrawal NEVER (re)closes an order that has been closed
-    before: the close is invalidated and stays invalidated — the order shows
-    REOPENED, never "still closed", no matter how well the data matches after
-    the correction. Only genuine new business can close it again: a new
-    window joining (WINDOW_JOINED), a withdrawn window reviving
-    (WINDOW_REVIVED), a carry finally closing (CARRY_RESOLVED), or an outbound
-    migration finally cutting / being voided (MIGRATION_CUT /
-    MIGRATION_VOIDED), evaluated against the close conditions. Anything else short of CLOSE is OPEN while
-    windows are still being collected and WAITING once only one-sided gaps
-    (or in-flight carries) remain — labelled REOPENED instead once the order
-    has been closed before.
+    The hard reopen rule is scoped to ONE version: a correction or withdrawal
+    arriving while the order is still CLOSED (``prev_status == 'CLOSED'``)
+    always invalidates that close — the order shows REOPENED even if the
+    correction still matches on both sides ("关单后那一版订正/撤回一律先重开，
+    绝不还显示关着"). But a correction arriving when the order is ALREADY
+    reopened is ordinary new activity: it is evaluated against the close
+    conditions and may close again ("重开的单在之后任何一个新结果版本到来时
+    重新评估，满足关单条件才重新 CLOSED"). Genuine new business — a new window
+    joining (WINDOW_JOINED), a withdrawn window reviving (WINDOW_REVIVED), a
+    carry finally closing (CARRY_RESOLVED), or an outbound migration cutting /
+    being voided (MIGRATION_CUT / MIGRATION_VOIDED) — is likewise evaluated
+    normally. Anything short of CLOSE is OPEN while windows are still being
+    collected and WAITING once only one-sided gaps (or in-flight carries)
+    remain — labelled REOPENED instead once the order has been closed before.
     """
     live = [b for b in bindings if b["result_status"] == "CURRENT"]
     if not live:
         return "VOID"
-    if ever_closed and reason in ("WINDOW_CORRECTED", "WINDOW_WITHDRAWN"):
+    # Only the version that lands ON a still-closed order forces a reopen;
+    # corrections after the order is already reopened are re-evaluated.
+    from_closed = prev_status == "CLOSED" if prev_status is not None else ever_closed
+    if from_closed and reason in ("WINDOW_CORRECTED", "WINDOW_WITHDRAWN"):
         return "REOPENED"
     if missing or pending or any(b["result_status"] == "RETRACTED" for b in bindings):
         return "REOPENED" if ever_closed else "OPEN"
@@ -1058,6 +1068,25 @@ def carry_open_block_order(open_count):
     """An order cannot reach CLOSED while one of its keys' carries is still
     open/reopened (events are in flight between two windows)."""
     return bool(open_count)
+
+
+def migration_open_block_order(open_count):
+    """An order cannot reach CLOSED while one of this key's outbound migrations
+    is still OPEN (declared, not cut): the key's tail from S on is held pending
+    the cut, so the business is not fully resolved ("还没切的迁出" is a waiting
+    state). A REOPENED migration already routed its tail away (it no longer
+    belongs to this key) and therefore does not block; the caller excludes
+    non-OPEN rows from ``open_count``."""
+    return bool(open_count)
+
+
+def migration_cut_ready(mark_a, mark_b, window_end):
+    """An OPEN migration cuts once BOTH sides of the from_key have crossed the
+    start window's end — the same per-key crossing evidence ordinary window
+    closing uses (own progress / real-promise watermark / idle finalization of
+    a side that already has data). Until then the declaration waits and keeps
+    holding the tail; a slow or silent side is never cut past."""
+    return window_ready(mark_a, mark_b, window_end)
 
 
 def build_order_snapshot(bindings):

@@ -827,6 +827,11 @@ CREATE TABLE IF NOT EXISTS key_migrations (
     recut_count             INT NOT NULL DEFAULT 0,
     void_reason             TEXT CHECK (void_reason IN
                             ('operator_void', 'source_retracted')),
+    -- Frozen routing picture at the (re)cut: every surviving routed event and
+    -- the origin window it belongs to. A later derivation compares this to
+    -- the live routed set: a change in the start window invalidates the cut
+    -- (REOPENED), so a cut can never keep showing a stale snapshot.
+    cut_signature           JSONB,
     last_block_reason       TEXT,  -- why an OPEN migration cannot cut right now
     created_by              TEXT,
     note                    TEXT,
@@ -845,6 +850,9 @@ CREATE INDEX IF NOT EXISTS key_migrations_from_idx
     ON key_migrations (from_key, id);
 CREATE INDEX IF NOT EXISTS key_migrations_to_idx
     ON key_migrations (to_key, id) WHERE status <> 'VOID';
+-- Upgrade path for databases created while the migration feature was being
+-- built with the table but no frozen-signature column.
+ALTER TABLE key_migrations ADD COLUMN IF NOT EXISTS cut_signature JSONB;
 CREATE TABLE IF NOT EXISTS key_migration_events (
     id            BIGSERIAL PRIMARY KEY,
     migration_id  BIGINT NOT NULL REFERENCES key_migrations(id),
@@ -1313,33 +1321,110 @@ def pull_stream(conn, stream, base_url):
             break
         with conn, conn.cursor() as cur:
             for ev in batch:
+                rejected_reason = None
+                migration_id = None
+                if ev["type"] == "upsert":
+                    # The from_key is sealed once a migration has cut: a late
+                    # upsert at/after the start window must FAIL rather than
+                    # silently route or produce its own result ("切过去之后，
+                    # 迁出键再来新事件要失败"). The row is still stored and
+                    # marked rejected so the rejection is auditable; retractions
+                    # are NOT sealed (they correct already-routed events).
+                    cur.execute(
+                        """SELECT id, status, start_window_start
+                           FROM key_migrations
+                           WHERE from_key = %s AND status IN ('CUT', 'REOPENED')
+                             AND %s >= start_window_start
+                           ORDER BY id LIMIT 1""",
+                        (ev["key"], ev["event_time"]),
+                    )
+                    seal = cur.fetchone()
+                    if seal is not None:
+                        rejected_reason = (
+                            f"from_key sealed by migration {seal[0]} ({seal[1]})")
+                        migration_id = seal[0]
                 cur.execute(
-                    """INSERT INTO stream_events (stream, event_id, event_time, key, type, retracts, payload, seq)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """INSERT INTO stream_events
+                           (stream, event_id, event_time, key, type, retracts, payload,
+                            seq, rejected, rejected_reason, migration_id)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                        ON CONFLICT (stream, event_id) DO NOTHING""",
                     (stream, ev["event_id"], ev["event_time"], ev["key"], ev["type"],
                      ev.get("retracts"),
                      psycopg2.extras.Json(ev["payload"]) if ev.get("payload") is not None else None,
-                     ev["seq"]),
+                     ev["seq"], rejected_reason is not None, rejected_reason,
+                     migration_id),
                 )
                 if cur.rowcount == 0:
                     continue  # replayed row, already applied
                 if ev["type"] == "upsert":
                     ws, _ = window_of(ev["event_time"], WINDOW_MS)
+                    if rejected_reason is not None:
+                        # Sealed: the event must appear nowhere — not on the
+                        # from_key's own results and not routed to the to_key.
+                        log.info("upsert %s on sealed from_key %s rejected: %s",
+                                 ev["event_id"], ev["key"], rejected_reason)
+                        continue
                     dirty.append((ws, ev["key"], "LATE_EVENT",
                                   {"stream": stream, "event_id": ev["event_id"],
                                    "event_time": ev["event_time"]}))
                 else:  # retract: the *target's* window is the one affected
                     cur.execute(
-                        "SELECT event_time, key FROM stream_events WHERE stream = %s AND event_id = %s",
+                        """SELECT event_time, key, rejected
+                           FROM stream_events WHERE stream = %s AND event_id = %s""",
                         (stream, ev["retracts"]),
                     )
                     target = cur.fetchone()
                     if target:
-                        ws, _ = window_of(target[0], WINDOW_MS)
-                        dirty.append((ws, target[1], "RETRACTION",
-                                      {"stream": stream, "retract_event_id": ev["event_id"],
-                                       "retracted_event_id": ev["retracts"]}))
+                        target_time, target_key, target_rejected = target
+                        ws, _ = window_of(target_time, WINDOW_MS)
+                        # A retraction of an event the migration routed (and
+                        # which belongs to the start window) can invalidate the
+                        # cut — the sweep re-derives the routing from the
+                        # surviving events; just make sure the to_key windows it
+                        # touched get recomputed this tick.
+                        cur.execute(
+                            """SELECT id, to_key, start_window_start
+                               FROM key_migrations
+                               WHERE from_key = %s AND status IN ('CUT', 'REOPENED')
+                                 AND %s >= start_window_start
+                               ORDER BY id LIMIT 1""",
+                            (target_key, target_time),
+                        )
+                        cut = cur.fetchone()
+                        if cut is not None:
+                            mid, to_key, cut_start = cut
+                            # Every to_key window the live routing touches may
+                            # change; the migration sweep (derive_migrations)
+                            # decides reopen / recut / void from the surviving
+                            # events and re-emits each affected window.
+                            cur.execute(
+                                """SELECT DISTINCT (e.event_time / %s) * %s
+                                   FROM stream_events e, key_migrations m
+                                   WHERE m.id = %s AND e.key = m.from_key
+                                     AND e.type = 'upsert' AND NOT e.rejected
+                                     AND e.event_time >= m.start_window_start
+                                     AND NOT EXISTS (
+                                         SELECT 1 FROM stream_events r
+                                         WHERE r.type = 'retract' AND r.stream = e.stream
+                                           AND r.retracts = e.event_id)""",
+                                (WINDOW_MS, WINDOW_MS, mid),
+                            )
+                            for (rws,) in cur.fetchall():
+                                dirty.append((rws, to_key, "RETRACTION",
+                                              {"stream": stream,
+                                               "retract_event_id": ev["event_id"],
+                                               "retracted_event_id": ev["retracts"],
+                                               "migration_id": mid}))
+                        # A window the cut already routed away is no longer the
+                        # from_key's business: it must never be re-emitted as
+                        # its own result by the ordinary dirty-window path.
+                        from_key_routed = cut is not None and ws >= cut_start
+                        if not target_rejected and not from_key_routed:
+                            dirty.append((ws, target_key, "RETRACTION",
+                                          {"stream": stream,
+                                           "retract_event_id": ev["event_id"],
+                                           "retracted_event_id": ev["retracts"]}))
                     # else: target not arrived yet; when it does, the retract is
                     # already stored and the NOT EXISTS filter excludes it.
             cur.execute("UPDATE offsets SET last_seq = %s WHERE stream = %s",
@@ -1464,6 +1549,71 @@ def active_grace_pairs(cur):
     return {(r[0], r[1]) for r in cur.fetchall()}
 
 
+def held_tail_pairs(cur):
+    """The {(window_start, from_key)} pairs an OPEN outbound migration holds:
+    every from_key window (that actually has events) at/after its start
+    window. Such windows neither emit their own result nor count as the
+    from_key order's missing/pending business while the declaration waits to
+    cut — the tail is explicitly on hold, not a missing result. CUT/REOPENED
+    migrations are excluded: the tail is already routed away (excluded from
+    the order via routed_tail_windows) and only an emitted result's ordinary
+    correction path may touch pre-cut windows."""
+    cur.execute(
+        """SELECT start_window_start, from_key FROM key_migrations
+           WHERE status = 'OPEN'""")
+    rows = cur.fetchall()
+    if not rows:
+        return set()
+    cur.execute(
+        """SELECT DISTINCT (event_time / %s) * %s AS ws, key
+           FROM stream_events WHERE type = 'upsert' AND NOT rejected""",
+        (WINDOW_MS, WINDOW_MS))
+    event_windows = cur.fetchall()
+    held = set()
+    for start, from_key in rows:
+        for ws, key in event_windows:
+            if key == from_key and ws >= start:
+                held.add((ws, from_key))
+    return held
+
+
+def routed_tail_windows(cur, key):
+    """Window starts of ``key`` whose tail already left via a CUT/REOPENED
+    outbound migration (windows at/after its start). They are no longer this
+    key's business: never counted missing or pending in its order. Returns
+    the minimum such start when any migration applies (all later windows are
+    covered, since at most one non-VOID outbound migration exists per key)."""
+    cur.execute(
+        """SELECT min(start_window_start) FROM key_migrations
+           WHERE from_key = %s AND status IN ('CUT', 'REOPENED')""",
+        (key,))
+    return cur.fetchone()[0]
+
+
+def routed_tail_pairs(cur):
+    """The {(window_start, from_key)} pairs a CUT/REOPENED outbound migration
+    already routed away: from_key windows (that actually hold events) at/after
+    its start. They must never produce an own result again — the tail belongs
+    to the to_key now ("切过去之后迁出键不能再出自己的结果")."""
+    cur.execute(
+        """SELECT start_window_start, from_key FROM key_migrations
+           WHERE status IN ('CUT', 'REOPENED')""")
+    rows = cur.fetchall()
+    if not rows:
+        return set()
+    cur.execute(
+        """SELECT DISTINCT (event_time / %s) * %s AS ws, key
+           FROM stream_events WHERE type = 'upsert' AND NOT rejected""",
+        (WINDOW_MS, WINDOW_MS))
+    event_windows = cur.fetchall()
+    routed = set()
+    for start, from_key in rows:
+        for ws, key in event_windows:
+            if key == from_key and ws >= start:
+                routed.add((ws, from_key))
+    return routed
+
+
 def close_windows(conn):
     """Emit INITIAL results for (window, key) pairs whose own two sides have
     both crossed the window end.
@@ -1492,8 +1642,26 @@ def close_windows(conn):
         sides = effective_data_sides(cur)
         due = due_graces(cur)
         held = active_grace_pairs(cur)
+
+        def tail_is_migrating(cur, key, ws):
+            """Live check: this from_key window is covered by an unfinished
+            outbound migration (OPEN holds it pending the cut; CUT/REOPENED
+            routed it away). Queried per window rather than from a snapshot
+            taken at tick start, because derive_migrations runs earlier in
+            the same tick and can flip OPEN -> CUT in between."""
+            cur.execute(
+                """SELECT 1 FROM key_migrations
+                   WHERE from_key = %s AND status <> 'VOID'
+                     AND %s >= start_window_start LIMIT 1""",
+                (key, ws))
+            return cur.fetchone() is not None
+
     for g in due:
         key, ws = g["key"], g["window_start"]
+        with conn.cursor() as cur:
+            migrating = tail_is_migrating(cur, key, ws)
+        if migrating:
+            continue  # an outbound migration holds/routed this tail window
         end = ws + WINDOW_MS
         marks = emission_marks(wms, key_max, sides, key, ws)
         # The deadline, not the crossing evidence, decides now: emit takes
@@ -1509,6 +1677,10 @@ def close_windows(conn):
     for key, ws in sides:
         if (ws, key) in held:
             continue  # an active grace holds exactly this one pair
+        with conn.cursor() as cur:
+            migrating = tail_is_migrating(cur, key, ws)
+        if migrating:
+            continue  # an unfinished outbound migration covers this tail
         end = ws + WINDOW_MS
         marks = emission_marks(wms, key_max, sides, key, ws)
         if not window_ready(marks["a"], marks["b"], end):
@@ -1522,7 +1694,6 @@ def close_windows(conn):
                 "watermark_a": marks["a"]["watermark"],
                 "watermark_b": marks["b"]["watermark"],
             })
-
 
 # ---------------------------------------------------------------------------
 # business orders (业务单)
@@ -1558,13 +1729,26 @@ def order_window_gaps(cur, key, bound):
     the same per-key gate that drives emission. A window held by an ACTIVE
     close grace counts as pending: it deliberately waits past the window end
     for the other side and must not read as a missing result to the order;
-    the deadline sweep emits it before orders are built on the same tick."""
+    the deadline sweep emits it before orders are built on the same tick.
+
+    A window of this key is not this order's business at all while an
+    outbound migration covers it: an OPEN migration HOLDS its tail pending
+    the cut (counted as pending — the business is explicitly waiting, not
+    missing a result), and a CUT/REOPENED migration has routed the tail to
+    another key (excluded entirely, like a window with no own events)."""
     wms = current_watermarks(cur)
     key_max = key_max_event_times(cur, key)
     sides = effective_data_sides(cur, key)
     graced = active_grace_pairs(cur)
+    held = held_tail_pairs(cur)
+    routed_from = routed_tail_windows(cur, key)
     missing, pending = [], []
     for ws in business_windows(cur, key) - bound:
+        if routed_from is not None and ws >= routed_from:
+            continue  # tail routed away to the to_key — not this order
+        if (ws, key) in held:
+            pending.append(ws)  # an OPEN migration holds this tail window
+            continue
         if (ws, key) in graced:
             pending.append(ws)
             continue
@@ -1585,12 +1769,12 @@ def fold_order(cur, key, reason, trigger_ws=None, trigger_result_version=None,
     The caller already holds the key's gate row lock; a non-advancing fold
     (identical status and snapshot) writes nothing.
     """
-    cur.execute("SELECT id, head_version, ever_closed FROM biz_orders WHERE key = %s",
+    cur.execute("SELECT id, head_version, ever_closed, status FROM biz_orders WHERE key = %s",
                 (key,))
     row = cur.fetchone()
     if row is None:
         return None
-    order_id, head_version, ever_closed = row
+    order_id, head_version, ever_closed, prev_status = row
     cur.execute(
         """SELECT window_start, window_end, result_version, result_status, has_gap,
                   match_count, unmatched_a, unmatched_b, carried_a, carried_b,
@@ -1606,8 +1790,15 @@ def fold_order(cur, key, reason, trigger_ws=None, trigger_result_version=None,
         (key,),
     )
     open_carries = cur.fetchone()[0]
+    cur.execute(
+        "SELECT count(*) FROM key_migrations WHERE from_key = %s AND status = 'OPEN'",
+        (key,),
+    )
+    open_migrations = cur.fetchone()[0]
     status = evaluate_order(bindings, missing, pending, ever_closed, reason,
-                            open_carry_count=open_carries)
+                            open_carry_count=open_carries,
+                            open_migration_count=open_migrations,
+                            prev_status=prev_status)
     version = head_version + 1
     cur.execute(
         """INSERT INTO biz_order_versions
@@ -2221,6 +2412,487 @@ def emit_voided_targets(conn, voided_targets):
             emit(conn, tws, key, "CARRY_FORWARD", {"op": "carry_voided"})
 
 
+# ---------------------------------------------------------------------------
+# business-key migrations (业务键迁出)
+# ---------------------------------------------------------------------------
+# A migration routes the whole tail of one business key (from_key) to another
+# key (to_key) from a start window S on. While OPEN the from_key's windows at
+# and after S are held (no own result); once both sides of the from_key have
+# crossed S's end the migration CUTS: every surviving from_key event with
+# event_time >= S starts routing into the to_key, the cut snapshots the two
+# sides' versions, and the from_key is sealed (later upserts are rejected at
+# pull time). A later correction/retraction invalidates the cut (REOPENED);
+# the derivation either settles a fresh CUT (MIGRATION_RECUT) or auto-voids
+# when nothing routed survives. Manual void is only possible while OPEN.
+#
+# Every writer takes the involved keys' gate row locks in a fixed order
+# (sorted by key, then the migration row), the same order the emit path uses,
+# so a cut emitting to_key windows and an ordinary from_key emit cannot
+# interleave.
+
+def migration_event(cur, migration_id, from_key, to_key, event,
+                    window_start=None, detail=None, operator=None):
+    cur.execute(
+        """INSERT INTO key_migration_events
+               (migration_id, from_key, to_key, event, window_start, detail, operator)
+           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+        (migration_id, from_key, to_key, event, window_start,
+         psycopg2.extras.Json(detail) if detail is not None else None, operator),
+    )
+
+
+def migration_row_dict(cur, migration_id):
+    cur.execute("SELECT * FROM key_migrations WHERE id = %s", (migration_id,))
+    row = cur.fetchone()
+    return dict(row) if isinstance(row, dict) else (
+        dict(zip([d[0] for d in cur.description], row)) if row else None)
+
+
+def outbound_migrations_for_key(cur, key):
+    """All non-VOID migrations routing this key's tail AWAY: status, start
+    window. A CUT/REOPENED migration removes the key's tail windows from its
+    order; an OPEN migration blocks its order from CLOSED."""
+    cur.execute(
+        """SELECT id, to_key, start_window_start, status
+           FROM key_migrations WHERE from_key = %s AND status <> 'VOID'
+           ORDER BY id""",
+        (key,),
+    )
+    return [dict(zip(["id", "to_key", "start_window_start", "status"], r))
+            for r in cur.fetchall()]
+
+
+def routed_events_signature(cur, migration_id):
+    """The live routed set of a (cut or reopened) migration: every surviving
+    (non-retracted, non-rejected) from_key upsert at/after the start window,
+    bucketed by ORIGIN window, plus the per-origin-window lists. This is the
+    frozen content a cut promises; a change on the next derivation invalidates
+    the cut (REOPENED). Returns ``{"windows": {ws: {"a": [...], "b": [...]}},
+    "events": {event_id: (side, origin_ws)}}``."""
+    cur.execute(
+        """SELECT e.stream, e.event_id, (e.event_time / %s) * %s AS origin_ws
+           FROM key_migrations m
+           JOIN stream_events e
+             ON e.key = m.from_key AND e.type = 'upsert' AND NOT e.rejected
+                AND e.event_time >= m.start_window_start
+                AND NOT EXISTS (
+                    SELECT 1 FROM stream_events r
+                    WHERE r.type = 'retract' AND r.stream = e.stream
+                      AND r.retracts = e.event_id)
+           WHERE m.id = %s
+           ORDER BY origin_ws, e.stream, e.event_time, e.event_id""",
+        (WINDOW_MS, WINDOW_MS, migration_id),
+    )
+    windows, events = {}, {}
+    for side, event_id, origin_ws in cur.fetchall():
+        windows.setdefault(origin_ws, {"a": [], "b": []})[side].append(event_id)
+        events[event_id] = (side, origin_ws)
+    return {"windows": windows, "events": events}
+
+
+def create_migration(conn, from_key, to_key, start_window_start,
+                     operator=None, note=None):
+    """Declare a migration (status OPEN). Preconditions (migration_create_error):
+    from_key != to_key; the start window is a boundary (422); neither key has
+    produced a result at S or later (409); neither key is already a side of an
+    unfinished migration (409). The from_key's windows at/after S are held from
+    the next tick on; the declaration itself emits nothing."""
+    if not from_key or not to_key:
+        raise HTTPException(422, "from_key and to_key are required")
+    if not valid_window_start(start_window_start, WINDOW_MS):
+        raise HTTPException(422,
+                            f"start_window_start {start_window_start} is not a window boundary")
+    keys = sorted({from_key, to_key})
+    with conn, conn.cursor() as cur:
+        # Fixed global lock order across both keys.
+        for k in keys:
+            cur.execute(
+                "INSERT INTO release_gates (key) VALUES (%s) ON CONFLICT (key) DO NOTHING",
+                (k,),
+            )
+        for k in keys:
+            cur.execute("SELECT 1 FROM release_gates WHERE key = %s FOR UPDATE", (k,))
+            cur.fetchone()
+
+        from_emitted = get_head(cur, start_window_start, from_key) is not None
+        # Any result at S or later on the from_key tail blocks declaration.
+        if not from_emitted:
+            cur.execute(
+                "SELECT 1 FROM results WHERE key = %s AND window_start >= %s LIMIT 1",
+                (from_key, start_window_start),
+            )
+            from_emitted = cur.fetchone() is not None
+        cur.execute(
+            "SELECT 1 FROM results WHERE key = %s AND window_start >= %s LIMIT 1",
+            (to_key, start_window_start),
+        )
+        to_emitted = cur.fetchone() is not None
+        cur.execute(
+            "SELECT 1 FROM key_migrations WHERE from_key = %s AND status <> 'VOID' LIMIT 1",
+            (from_key,),
+        )
+        from_busy = cur.fetchone() is not None
+        cur.execute(
+            """SELECT 1 FROM key_migrations
+               WHERE (from_key = %s OR to_key = %s) AND status <> 'VOID' LIMIT 1""",
+            (to_key, to_key),
+        )
+        to_busy = cur.fetchone() is not None
+        err = migration_create_error(from_emitted, to_emitted,
+                                     from_busy, to_busy, from_key == to_key)
+        if err is not None:
+            messages = {
+                "same_key": "from_key and to_key must differ (同一业务键不能迁给自己)",
+                "from_window_emitted":
+                    f"from_key {from_key!r} already produced a result at window "
+                    f"{start_window_start} or later — 已经出过结果的尾巴不能迁出",
+                "to_window_emitted":
+                    f"to_key {to_key!r} already produced a result at window "
+                    f"{start_window_start} or later — 迁入键已经出过的窗口不能当起始窗",
+                "from_key_busy":
+                    f"from_key {from_key!r} already has an unfinished migration "
+                    "(同一迁出键不能同时开着两笔迁出)",
+                "to_key_busy":
+                    f"to_key {to_key!r} is already a side of an unfinished migration "
+                    "(一个键不能同时卷进两笔没结束的迁出)",
+            }
+            raise HTTPException(409, messages[err])
+
+        cur.execute(
+            """INSERT INTO key_migrations
+                   (from_key, to_key, start_window_start, start_window_end,
+                    created_by, note)
+               VALUES (%s, %s, %s, %s, %s, %s) RETURNING *""",
+            (from_key, to_key, start_window_start,
+             start_window_start + WINDOW_MS, operator, note),
+        )
+        row = cur.fetchone()
+        migration = dict(row) if isinstance(row, dict) else dict(
+            zip([d[0] for d in cur.description], row))
+        mid = migration["id"]
+        migration_event(cur, mid, from_key, to_key, "MIGRATION_OPENED",
+                        window_start=start_window_start,
+                        detail={"start_window_start": start_window_start},
+                        operator=operator)
+        migration = migration_row_dict(cur, mid)
+    log.info("migration %s opened: %s -> %s from window %d",
+             mid, from_key, to_key, start_window_start)
+    return migration
+
+
+def move_migration_start(conn, migration_id, new_start_window_start,
+                         operator=None):
+    """Move the start window of an OPEN migration (the declaration is not cut
+    yet). Same preconditions on the new S as a fresh declaration; the old tail
+    windows go back to ordinary closing. Append-only trail."""
+    if not valid_window_start(new_start_window_start, WINDOW_MS):
+        raise HTTPException(422,
+                            f"start_window_start {new_start_window_start} is not a window boundary")
+    with conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM key_migrations WHERE id = %s FOR UPDATE",
+                    (migration_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(404, "no such migration")
+        m = dict(row) if isinstance(row, dict) else dict(
+            zip([d[0] for d in cur.description], row))
+        if m["status"] != "OPEN":
+            raise HTTPException(
+                409, f"migration {migration_id} is {m['status']} — only an OPEN "
+                "migration's start window can be moved")
+        from_key, to_key, old_start = m["from_key"], m["to_key"], m["start_window_start"]
+        if new_start_window_start == old_start:
+            return migration_row_dict(cur, migration_id)
+        for k in sorted({from_key, to_key}):
+            cur.execute("SELECT 1 FROM release_gates WHERE key = %s FOR UPDATE", (k,))
+            cur.fetchone()
+        cur.execute(
+            "SELECT 1 FROM results WHERE key = %s AND window_start >= %s LIMIT 1",
+            (from_key, new_start_window_start),
+        )
+        from_emitted = cur.fetchone() is not None
+        cur.execute(
+            "SELECT 1 FROM results WHERE key = %s AND window_start >= %s LIMIT 1",
+            (to_key, new_start_window_start),
+        )
+        to_emitted = cur.fetchone() is not None
+        if from_emitted:
+            raise HTTPException(
+                409, f"from_key {from_key!r} already produced a result at window "
+                f"{new_start_window_start} or later")
+        if to_emitted:
+            raise HTTPException(
+                409, f"to_key {to_key!r} already produced a result at window "
+                f"{new_start_window_start} or later")
+        cur.execute(
+            """UPDATE key_migrations
+               SET start_window_start = %s, start_window_end = %s
+               WHERE id = %s""",
+            (new_start_window_start, new_start_window_start + WINDOW_MS, migration_id),
+        )
+        migration_event(cur, migration_id, from_key, to_key,
+                        "START_WINDOW_CHANGED", window_start=new_start_window_start,
+                        detail={"old_start_window_start": old_start,
+                                "new_start_window_start": new_start_window_start},
+                        operator=operator)
+        migration = migration_row_dict(cur, migration_id)
+    log.info("migration %s start window moved: %d -> %d",
+             migration_id, old_start, new_start_window_start)
+    return migration
+
+
+def void_migration(conn, migration_id, reason="operator_void", operator=None):
+    """Void an OPEN migration (the only manual-void state) or an already
+    auto-voided row (idempotent). After a void the from_key emits its own
+    windows again; the same row can never cut. The from_key order is folded
+    (MIGRATION_VOIDED) once, and its windows return to ordinary closing this
+    tick."""
+    if reason not in ("operator_void", "source_retracted"):
+        raise HTTPException(422, "bad void reason")
+    with conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM key_migrations WHERE id = %s FOR UPDATE",
+                    (migration_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(404, "no such migration")
+        m = dict(row) if isinstance(row, dict) else dict(
+            zip([d[0] for d in cur.description], row))
+        if m["status"] == "VOID":
+            return migration_row_dict(cur, migration_id)
+        if m["status"] != "OPEN" and reason == "operator_void":
+            raise HTTPException(
+                409, f"migration {migration_id} is {m['status']} — 作废只能在还没切过去时做")
+        from_key, to_key = m["from_key"], m["to_key"]
+        for k in sorted({from_key, to_key}):
+            cur.execute("SELECT 1 FROM release_gates WHERE key = %s FOR UPDATE", (k,))
+            cur.fetchone()
+        cur.execute(
+            """UPDATE key_migrations
+               SET status = 'VOID', void_reason = %s, voided_at = now()
+               WHERE id = %s""",
+            (reason, migration_id),
+        )
+        migration_event(cur, migration_id, from_key, to_key, "MIGRATION_VOIDED",
+                        window_start=m["start_window_start"],
+                        detail={"reason": reason}, operator=operator)
+        migration = migration_row_dict(cur, migration_id)
+    # The from_key tail comes back: close it normally this tick, let the
+    # ordinary builder fold its new results, then append the migration-driven
+    # order version. Done outside the row-lock transaction via emit helpers.
+    close_key_windows(conn, from_key)
+    build_orders(conn)
+    with conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM biz_orders WHERE key = %s", (from_key,))
+        if cur.fetchone() is not None:
+            fold_order(cur, from_key, "MIGRATION_VOIDED",
+                       m["start_window_start"], None, None)
+    log.info("migration %s voided (%s): %s -> %s",
+             migration_id, reason, from_key, to_key)
+    return migration
+
+
+def close_key_windows(conn, key):
+    """Emit every now-due window of one key (ordinary per-key closing). Used
+    after an OPEN migration is voided so its released tail starts producing
+    its own results immediately."""
+    with conn.cursor() as cur:
+        wms = current_watermarks(cur)
+        key_max = key_max_event_times(cur, key)
+        sides = effective_data_sides(cur, key)
+    for (k, ws) in list(sides.keys()):
+        if k != key:
+            continue
+        with conn.cursor() as cur:
+            if get_head(cur, ws, key) is not None:
+                continue
+        end = ws + WINDOW_MS
+        marks = emission_marks(wms, key_max, sides, key, ws)
+        if window_ready(marks["a"], marks["b"], end):
+            emit(conn, ws, key, "INITIAL", {
+                "side_a": side_evidence(marks["a"], end),
+                "side_b": side_evidence(marks["b"], end),
+                "watermark_a": marks["a"]["watermark"],
+                "watermark_b": marks["b"]["watermark"],
+            })
+
+
+def cut_migration(cur, m, reopen):
+    """Mark a migration CUT under the caller's transaction and held gate
+    locks: freeze the routed signature, record the from_key head strictly
+    before S ("两边当时各是哪一版"), and write the lifecycle event. Returns
+    the sorted origin windows the live routing touches — the caller emits the
+    corresponding to_key windows after the transaction commits."""
+    mid = m["id"]
+    from_key, to_key = m["from_key"], m["to_key"]
+    start = m["start_window_start"]
+    sig = routed_events_signature(cur, mid)
+    cur.execute(
+        """SELECT window_start, version FROM results
+           WHERE key = %s AND window_start < %s
+           ORDER BY window_start DESC, version DESC LIMIT 1""",
+        (from_key, start),
+    )
+    pre = cur.fetchone()
+    cut_from_window_start = pre[0] if pre else None
+    cut_from_version = pre[1] if pre else None
+
+    emitted_windows = sorted(sig["windows"].keys())
+    cur.execute(
+        """UPDATE key_migrations
+           SET status = 'CUT', cut_at = now(), cut_signature = %s,
+               cut_from_version = %s, cut_from_window_start = %s,
+               recut_count = recut_count + %s, void_reason = NULL,
+               voided_at = NULL, last_block_reason = NULL
+           WHERE id = %s""",
+        (psycopg2.extras.Json(sig["windows"]), cut_from_version,
+         cut_from_window_start, 1 if reopen else 0, mid),
+    )
+    migration_event(cur, mid, from_key, to_key,
+                    "MIGRATION_RECUT" if reopen else "MIGRATION_CUT",
+                    window_start=start,
+                    detail={"cut_from_version": cut_from_version,
+                            "cut_from_window_start": cut_from_window_start,
+                            "routed_windows": emitted_windows,
+                            "routed_events": len(sig["events"])})
+    return emitted_windows
+
+
+def lock_keys(cur, keys):
+    """Take the gate-row locks for every involved key in one fixed global
+    order (sorted key), the same order every migration writer and emit()
+    uses, so concurrent migrations can never deadlock."""
+    for k in sorted(set(keys)):
+        cur.execute(
+            "INSERT INTO release_gates (key) VALUES (%s) ON CONFLICT (key) DO NOTHING",
+            (k,))
+    for k in sorted(set(keys)):
+        cur.execute("SELECT 1 FROM release_gates WHERE key = %s FOR UPDATE", (k,))
+        cur.fetchone()
+
+
+def derive_migrations(conn):
+    """One migration lifecycle sweep, every tick.
+
+    Phase 1 (per migration, one locked transaction each) decides the state
+    transition and commits it:
+    - OPEN with both sides of the from_key across S's end: CUT (or auto-VOID
+      source_retracted when nothing routable survives); an OPEN not yet
+      crossed just records why it waits;
+    - CUT/REOPENED re-derived from surviving events: no routed events left ->
+      terminal VOID (source_retracted); the live per-origin routing differing
+      from the frozen cut signature -> REOPENED then re-CUT in the same
+      transaction with a fresh snapshot (MIGRATION_REOPENED + MIGRATION_RECUT,
+      "已经切过去的必须重开再重切，不能还显示切成功了"); identical -> no-op.
+
+    Phase 2 (after the state transaction commits) emits the affected to_key
+    windows (render picks the now-committed routing up), lets the ordinary
+    order builder fold them, and folds the from_key order once with
+    MIGRATION_CUT / MIGRATION_VOIDED. Emitting under a separate transaction is
+    the same split create_carry uses and self-heals on crash: the committed
+    CUT row makes the next sweep/tick re-derive identical content.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT id FROM key_migrations
+               WHERE status IN ('OPEN', 'CUT', 'REOPENED') ORDER BY id""")
+        ids = [r[0] for r in cur.fetchall()]
+        wms = current_watermarks(cur)
+        key_max = key_max_event_times(cur)
+        sides = effective_data_sides(cur)
+
+    actions = []
+    for mid in ids:
+        action = None
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM key_migrations WHERE id = %s FOR UPDATE",
+                        (mid,))
+            row = cur.fetchone()
+            m = dict(row) if isinstance(row, dict) else dict(
+                zip([d[0] for d in cur.description], row))
+            from_key, to_key, start = m["from_key"], m["to_key"], m["start_window_start"]
+            lock_keys(cur, (from_key, to_key))
+
+            if m["status"] == "OPEN":
+                marks = emission_marks(wms, key_max, sides, from_key, start)
+                if not window_ready(marks["a"], marks["b"], start + WINDOW_MS):
+                    why_a = side_evidence(marks["a"], start + WINDOW_MS)
+                    why_b = side_evidence(marks["b"], start + WINDOW_MS)
+                    reason = f"waiting: side_a={why_a} side_b={why_b}"
+                    if m["last_block_reason"] != reason:
+                        cur.execute(
+                            "UPDATE key_migrations SET last_block_reason = %s WHERE id = %s",
+                            (reason, mid))
+                    continue
+                sig = routed_events_signature(cur, mid)
+                if not sig["events"]:
+                    cur.execute(
+                        """UPDATE key_migrations
+                           SET status = 'VOID', void_reason = 'source_retracted',
+                               voided_at = now() WHERE id = %s""",
+                        (mid,))
+                    migration_event(cur, mid, from_key, to_key, "MIGRATION_VOIDED",
+                                    window_start=start,
+                                    detail={"reason": "source_retracted",
+                                            "at": "cut_with_no_events"})
+                    action = {"void": True, "emit": []}
+                    log.info("migration %s auto-voided at cut (no routed events)", mid)
+                else:
+                    windows = cut_migration(cur, m, reopen=False)
+                    action = {"void": False, "emit": windows}
+                    log.info("migration %s CUT %s -> %s at window %d (%d events, %d windows)",
+                             mid, from_key, to_key, start,
+                             len(sig["events"]), len(windows))
+
+            elif m["status"] in ("CUT", "REOPENED"):
+                sig = routed_events_signature(cur, mid)
+                frozen = {int(k): v for k, v in (m.get("cut_signature") or {}).items()}
+                live = sig["windows"]
+                if not sig["events"]:
+                    cur.execute(
+                        """UPDATE key_migrations
+                           SET status = 'VOID', void_reason = 'source_retracted',
+                               voided_at = now() WHERE id = %s""",
+                        (mid,))
+                    migration_event(cur, mid, from_key, to_key, "MIGRATION_VOIDED",
+                                    window_start=start,
+                                    detail={"reason": "source_retracted"})
+                    action = {"void": True, "emit": sorted(frozen.keys())}
+                    log.info("migration %s auto-voided: every routed event retracted", mid)
+                elif frozen != live:
+                    cur.execute(
+                        """UPDATE key_migrations SET status = 'REOPENED'
+                           WHERE id = %s AND status = 'CUT'""",
+                        (mid,))
+                    migration_event(cur, mid, from_key, to_key, "MIGRATION_REOPENED",
+                                    window_start=start,
+                                    detail={"frozen": frozen, "live": live})
+                    windows = cut_migration(cur, migration_row_dict(cur, mid), reopen=True)
+                    action = {"void": False, "emit": windows}
+                    log.info("migration %s REOPENED and re-cut with a fresh snapshot", mid)
+                # content identical: stable CUT, nothing to do
+        if action is not None:
+            actions.append((mid, from_key, to_key, start, action))
+
+    # Phase 2: publish. The migration row is already committed, so the to_key
+    # render sees the routing; emit() takes its own gate-lock transaction.
+    for mid, from_key, to_key, start, action in actions:
+        for ws in action["emit"]:
+            emit(conn, ws, to_key, "MIGRATION",
+                 {"migration_id": mid,
+                  "op": "voided" if action["void"] else "cut"})
+        if action["void"]:
+            # The tail comes back to the from_key; close its due windows.
+            close_key_windows(conn, from_key)
+        build_orders(conn)
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM biz_orders WHERE key = %s", (from_key,))
+            if cur.fetchone() is not None:
+                fold_order(cur, from_key,
+                           "MIGRATION_VOIDED" if action["void"] else "MIGRATION_CUT",
+                           start, None, None)
+
+
+
 def tick(conn):
     dirty = []
     for stream, base_url in INGESTS.items():
@@ -2232,16 +2904,32 @@ def tick(conn):
     # event; a closed carry whose source merely corrected is reopened.
     voided_targets = invalidate_dirty_carries(conn, dirty)
     # Late data: recompute only windows that already have a result —
-    # windows not yet emitted will be covered by close_windows below.
+    # windows not yet emitted will be covered by close_windows below. A
+    # from_key window held by an OPEN migration or already routed away by a
+    # CUT migration is never emitted as the from_key's own result, even if a
+    # late event/retraction otherwise dirties it: its content belongs to the
+    # to_key (derive_migrations handles the re-emission there).
+    with conn.cursor() as cur:
+        held_migrations = held_tail_pairs(cur)
+        routed = routed_tail_pairs(cur)
     seen = set()
     for ws, key, reason, detail in dirty:
         if (ws, key, reason) in seen:
             continue
         seen.add((ws, key, reason))
+        if (key, ws) in held_migrations or (key, ws) in routed:
+            continue
         with conn.cursor() as cur:
             head = get_head(cur, ws, key)
         if head is not None:
             emit(conn, ws, key, reason, detail)
+    # Migration lifecycle BEFORE ordinary window closing: an OPEN migration
+    # whose from_key start window crossed on both sides THIS tick must cut and
+    # route its tail into the to_key — running close_windows first would emit
+    # the from_key's own INITIAL for that same window, breaking the invariant
+    # that a held/routed tail never produces an own result. The cut's to_key
+    # versions are emitted here; orders are folded after closing below.
+    derive_migrations(conn)
     close_windows(conn)
     build_orders(conn)
     # Recompute already-emitted targets of carries voided this tick (their
@@ -2251,6 +2939,9 @@ def tick(conn):
     # target-correction reopen all happen here.
     emit_voided_targets(conn, voided_targets)
     derive_carries(conn)
+    # Carries closing this tick fold orders with CARRY_RESOLVED; a migration
+    # cut this tick may settle those same orders.
+    build_orders(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -3909,12 +4600,13 @@ def windows():
                 )
                 heads = {(r["window_start"], r["key"]): r for r in cur.fetchall()}
                 cur.execute("SELECT key, open FROM release_gates")
-                gates = {r[0]: r[1] for r in cur.fetchall()}
+                gates = {r["key"]: r["open"] for r in cur.fetchall()}
                 cur.execute(
                     """SELECT window_start, key, id, due_at, extra_ms, created_at
                        FROM window_graces WHERE status = 'ACTIVE'""")
-                graces = {(r[0], r[1]): {"id": r[2], "due_at": r[3],
-                                         "extra_ms": r[4], "created_at": r[5]}
+                graces = {(r["window_start"], r["key"]):
+                              {"id": r["id"], "due_at": r["due_at"],
+                               "extra_ms": r["extra_ms"], "created_at": r["created_at"]}
                           for r in cur.fetchall()}
     finally:
         conn.close()
@@ -4370,9 +5062,15 @@ def gap_carry_create(body: CarryIn):
     conn = connect()
     try:
         try:
-            carry = create_carry(conn, body.source_window_start,
-                                 body.target_window_start, body.key, body.side,
-                                 body.event_ids, body.operator, body.note)
+            created = create_carry(conn, body.source_window_start,
+                                   body.target_window_start, body.key, body.side,
+                                   body.event_ids, body.operator, body.note)
+            # Re-read through carry_json so the 201 response carries the same
+            # item rows (real event ids, status) GET /gap-carries/{id} returns.
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM gap_carries WHERE id = %s",
+                            (created["id"],))
+                carry = carry_json(cur, cur.fetchone())
         except psycopg2.errors.UniqueViolation:
             raise HTTPException(
                 409, "one of these events already rides another carry "
@@ -4468,6 +5166,195 @@ def gap_carry_events(carry_id: int, limit: int = Query(default=1000)):
     finally:
         conn.close()
     return {"carry_id": carry_id, "events": rows}
+
+
+# ---------------------------------------------------------------------------
+# business-key migrations (业务键迁出)
+# ---------------------------------------------------------------------------
+
+class MigrationIn(BaseModel):
+    from_key: str = Field(min_length=1, max_length=200,
+                          description="business key whose tail migrates away (迁出键)")
+    to_key: str = Field(min_length=1, max_length=200,
+                        description="business key the tail routes into (迁入键)")
+    start_window_start: int = Field(
+        ge=0, description="first window routed over, a window boundary (起始窗)")
+    operator: Optional[str] = Field(default=None, max_length=200)
+    note: Optional[str] = Field(default=None, max_length=2000)
+
+
+class MigrationMoveIn(BaseModel):
+    start_window_start: int = Field(ge=0, description="new start window boundary")
+    operator: Optional[str] = Field(default=None, max_length=200)
+
+
+def migration_json(cur, row):
+    """One migration header plus live routed counters derived from the current
+    effective events, so OPEN rows show what is held and CUT rows show what
+    actually routes after later retractions."""
+    if isinstance(row, dict):
+        out = dict(row)
+        mid = row["id"]
+    else:
+        out = dict(zip([d[0] for d in cur.description], row))
+        mid = out["id"]
+    cur.execute(
+        """SELECT count(DISTINCT e.event_id) AS n_events,
+                  count(DISTINCT ((e.event_time / %s) * %s)) AS n_windows
+           FROM key_migrations m
+           JOIN stream_events e
+             ON e.key = m.from_key AND e.type = 'upsert' AND NOT e.rejected
+                AND e.event_time >= m.start_window_start
+                AND NOT EXISTS (
+                    SELECT 1 FROM stream_events r
+                    WHERE r.type = 'retract' AND r.stream = e.stream
+                      AND r.retracts = e.event_id)
+           WHERE m.id = %s""",
+        (WINDOW_MS, WINDOW_MS, mid),
+    )
+    got = cur.fetchone()
+    if isinstance(got, dict):
+        n_events, n_windows = got["n_events"], got["n_windows"]
+    else:
+        n_events, n_windows = got
+    out["routed_event_count"] = n_events
+    out["routed_window_count"] = n_windows
+    return out
+
+
+@app.post("/key-migrations", status_code=201)
+def key_migration_create(body: MigrationIn):
+    """Declare a business-key migration (OPEN): from this start window on the
+    from_key's tail no longer produces its own results and, once both sides of
+    the from_key cross the start window's end, routes into the to_key. The
+    start window must be a boundary (422); from_key and to_key must differ and
+    neither may already have produced a result at/after S, nor be a side of an
+    unfinished migration (409). The new migration is OPEN and queryable at once
+    with exactly the submitted start window."""
+    conn = connect()
+    try:
+        try:
+            migration = create_migration(
+                conn, body.from_key, body.to_key, body.start_window_start,
+                body.operator, body.note)
+        except psycopg2.errors.UniqueViolation:
+            raise HTTPException(
+                409, "one of these keys already has an unfinished migration "
+                     "(同一迁出/迁入键不能同时开着两笔迁出)")
+    finally:
+        conn.close()
+    return {"migration": migration}
+
+
+@app.get("/key-migrations")
+def key_migrations(from_key: Optional[str] = None, to_key: Optional[str] = None,
+                   key: Optional[str] = None, status: Optional[str] = None,
+                   open_only: bool = False, limit: int = Query(default=200)):
+    """Migration ledger (newest first): OPEN/CUT/REOPENED/VOID, the two keys,
+    the start window, cut snapshots, void reason and live routed counters.
+    Filters: from_key / to_key / key (either side) / status / open_only."""
+    if status is not None and status not in MIGRATION_STATUSES:
+        raise HTTPException(422, f"status must be one of {MIGRATION_STATUSES}")
+    conds, args = [], []
+    if from_key is not None:
+        conds.append("m.from_key = %s")
+        args.append(from_key)
+    if to_key is not None:
+        conds.append("m.to_key = %s")
+        args.append(to_key)
+    if key is not None:
+        conds.append("(m.from_key = %s OR m.to_key = %s)")
+        args.extend([key, key])
+    if status is not None:
+        conds.append("m.status = %s")
+        args.append(status)
+    if open_only:
+        conds.append("m.status IN ('OPEN', 'REOPENED')")
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"SELECT * FROM key_migrations m{where} ORDER BY m.id DESC LIMIT %s",
+                args + [min(max(limit, 1), 5000)],
+            )
+            rows = [migration_json(cur, r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    return {"migrations": rows}
+
+
+def _get_migration_or_404(cur, migration_id):
+    cur.execute("SELECT * FROM key_migrations WHERE id = %s", (migration_id,))
+    row = cur.fetchone()
+    if row is None:
+        raise HTTPException(404, "no such migration")
+    return row
+
+
+@app.get("/key-migrations/{migration_id}")
+def key_migration_get(migration_id: int):
+    """One migration's full current state: header, frozen cut signature and,
+    via the events trail, why it opened / cut / re-cut / reopened / voided."""
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            row = _get_migration_or_404(cur, migration_id)
+            payload = migration_json(cur, row)
+    finally:
+        conn.close()
+    return {"migration": payload}
+
+
+@app.get("/key-migrations/{migration_id}/events")
+def key_migration_events(migration_id: int, limit: int = Query(default=1000)):
+    """Append-only migration trail, chronological: MIGRATION_OPENED,
+    START_WINDOW_CHANGED, MIGRATION_CUT / MIGRATION_RECUT, MIGRATION_REOPENED
+    and MIGRATION_VOIDED (with reason)."""
+    conn = connect()
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _get_migration_or_404(cur, migration_id)
+            cur.execute(
+                """SELECT * FROM key_migration_events
+                   WHERE migration_id = %s ORDER BY id LIMIT %s""",
+                (migration_id, min(max(limit, 1), 5000)),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {"migration_id": migration_id, "events": rows}
+
+
+@app.post("/key-migrations/{migration_id}/start-window", status_code=200)
+def key_migration_move(migration_id: int, body: MigrationMoveIn):
+    """Move the start window of an OPEN migration (still uncut). Same
+    preconditions on the new S as a fresh declaration; only an OPEN row can be
+    re-aimed (409 after the cut). The change is append-only trail."""
+    conn = connect()
+    try:
+        migration = move_migration_start(
+            conn, migration_id, body.start_window_start, body.operator)
+    finally:
+        conn.close()
+    return {"migration": migration}
+
+
+@app.post("/key-migrations/{migration_id}/void")
+def key_migration_void(migration_id: int,
+                       body: Optional[dict] = None):
+    """Void an OPEN migration ("作废只能在还没切过去时做"): the from_key emits
+    its own windows again and this row can never cut; a terminal row is
+    idempotent. Manual void of a CUT/REOPENED migration is 409 — those only end
+    by auto-void when every routed event is retracted at the source."""
+    operator = (body or {}).get("operator")
+    conn = connect()
+    try:
+        migration = void_migration(conn, migration_id,
+                                   reason="operator_void", operator=operator)
+    finally:
+        conn.close()
+    return {"migration": migration}
 
 
 # ---------------------------------------------------------------------------
