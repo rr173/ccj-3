@@ -4140,7 +4140,14 @@ class CarryIn(BaseModel):
 
 
 def carry_json(cur, row):
-    """One carry header plus its item rows and live counters."""
+    """One carry header plus its item rows and live counters.
+
+    The caller's cursor is a RealDictCursor, so fetched rows are already
+    dicts keyed by column name — they must be used as-is. Zipping column
+    names over a dict iterates its KEYS, which would write the literal field
+    names as values (event_id -> "event_id", item_status -> "item_status", …)
+    and hide the real carried event id the carry was opened with.
+    """
     cur.execute(
         """SELECT event_id, event_time, side, item_status, matched_version,
                   matched_against, updated_at
@@ -4148,7 +4155,9 @@ def carry_json(cur, row):
            ORDER BY event_time, event_id""",
         (row["id"],),
     )
-    items = [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()]
+    fetched = cur.fetchall()
+    items = ([dict(r) for r in fetched] if fetched and isinstance(fetched[0], dict)
+             else [dict(zip([d[0] for d in cur.description], r)) for r in fetched])
     carried = [i for i in items if i["item_status"] == "CARRIED"]
     out = dict(row)
     out["items"] = items

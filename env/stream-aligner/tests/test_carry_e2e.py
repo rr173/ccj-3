@@ -247,11 +247,20 @@ def main():
     if c:
         check("all items MATCHED, frozen snapshot preserves the close-time match",
               c["matched_count"] == 1 and c["items"][0]["item_status"] == "MATCHED"
+              and c["items"][0]["event_id"] == f"{key}-a2"
               and c["items"][0]["matched_against"] == f"{key}-b4"
               and c["target_version"] == head(tgt, key)["version"]
               and c["matched_snapshot"]["matches"]
               == [{"event_id": f"{key}-a2", "matched_against": f"{key}-b4"}],
               str(c))
+        # GET items must carry the real submitted event id, never the literal
+        # column name (a dict-row zip bug wrote field names as values).
+        listed = [x for x in get(R, "/gap-carries", key=key)[1]["carries"]
+                  if x["id"] == cid][0]
+        check("list endpoint also returns the real carried event id (not the field name)",
+              [i["event_id"] for i in listed["items"]] == [f"{key}-a2"]
+              and {i["item_status"] for i in listed["items"]} == {"MATCHED"},
+              str(listed["items"]))
     trail = get(R, f"/gap-carries/{cid}/events")[1]["events"]
     kinds = [e["event"] for e in trail]
     check("trail has ITEM_MATCHED then CARRY_CLOSED",
