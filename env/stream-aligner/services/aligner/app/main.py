@@ -142,12 +142,16 @@ import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app.core import (MAX_GRACE_EXTRA_MS, ORDER_STATUSES, POSTING_STATUSES,
-                      build_order_snapshot,
+from app.core import (MAX_GRACE_EXTRA_MS, MIGRATION_STATUSES, ORDER_STATUSES,
+                      POSTING_STATUSES, build_order_snapshot,
                       annotate_source_payload,
                       compute_payload, compute_payload_with_carries,
+                      compute_payload_with_routes,
                       carry_item_fate, decide,
                       delivery_kind, evaluate_order, grace_grant_error,
+                      migration_create_error,
+                      migration_matched_event_ids,
+                      migration_unpaired_event_ids,
                       normalize_backfill_range, opposite_side, order_reason,
                       posting_status, ranges_overlap, reconciliation_can_close,
                       reconciliation_item_status, released_version_kind,
@@ -778,6 +782,116 @@ ALTER TABLE biz_order_versions ADD CONSTRAINT biz_order_versions_reason_check
 -- Source windows record which leftovers are currently routed out, per side.
 ALTER TABLE biz_order_windows ADD COLUMN IF NOT EXISTS carried_a INT NOT NULL DEFAULT 0;
 ALTER TABLE biz_order_windows ADD COLUMN IF NOT EXISTS carried_b INT NOT NULL DEFAULT 0;
+-- ---------------------------------------------------------------------------
+-- Business-key migrations (业务键迁出).
+--
+-- One row per declared migration of a whole key tail: from_key windows >=
+-- start_window_start no longer produce their own results; their events route
+-- into to_key windows from that window on. Lifecycle:
+--   OPEN     declared, not cut yet — the start window may still be changed
+--            and the declaration voided; the from_key's windows >= S are held;
+--   CUT      the start window became due while OPEN: every held from_key event
+--            (effective upserts with event_time >= S) started routing into the
+--            to_key, the cut snapshots the two sides' result versions, and the
+--            from_key is sealed (later upserts are rejected at pull time);
+--   REOPENED a later correction/retraction at either side of the start window
+--            invalidated the cut — it never keeps showing CUT. The routed
+--            events keep routing (to-key results stay correct); the derivation
+--            settles it back to CUT with a FRESH snapshot (MIGRATION_RECUT) or
+--            auto-voids it when every routed event was retracted at source;
+--   VOID     terminal. Manual void is only possible while OPEN ("作废只能在还
+--            没切过去时做"); a reopened cut also auto-voids once nothing routed
+--            survives. After a void the from_key emits its own windows again
+--            and the same row can never cut ("不能再拿这笔去切").
+--
+-- The partial unique indexes are the hard form of "同一迁出键不能同时开着两笔
+-- 还没结束的迁出" (and, conservatively, of never entangling one key in two
+-- unfinished migrations on either side): only non-VOID rows participate, so a
+-- voided migration never blocks a fresh one. key_migration_events is the
+-- append-only trail; to-key result versions produced by migration routing use
+-- reason MIGRATION (delivered downstream as an ordinary CORRECTION / NEW).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS key_migrations (
+    id                      BIGSERIAL PRIMARY KEY,
+    from_key                TEXT NOT NULL,
+    to_key                  TEXT NOT NULL,
+    start_window_start      BIGINT NOT NULL,   -- S: first window routed over
+    start_window_end        BIGINT NOT NULL,
+    status                  TEXT NOT NULL DEFAULT 'OPEN'
+                            CHECK (status IN ('OPEN', 'CUT', 'REOPENED', 'VOID')),
+    -- versions at the cut moment ("两边当时各是哪一版"):
+    cut_from_version        INT,   -- from_key head strictly before S at cut
+    cut_from_window_start   BIGINT,
+    cut_to_version          INT,   -- to_key head at S produced by the cut
+    cut_at                  TIMESTAMPTZ,
+    recut_count             INT NOT NULL DEFAULT 0,
+    void_reason             TEXT CHECK (void_reason IN
+                            ('operator_void', 'source_retracted')),
+    last_block_reason       TEXT,  -- why an OPEN migration cannot cut right now
+    created_by              TEXT,
+    note                    TEXT,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    voided_at               TIMESTAMPTZ,
+    CHECK (from_key <> to_key)
+);
+-- At most one unfinished migration OUT of a key.
+CREATE UNIQUE INDEX IF NOT EXISTS key_migrations_from_open_uq
+    ON key_migrations (from_key) WHERE status <> 'VOID';
+-- Conservatively also: one unfinished migration INTO a key (the to_key cannot
+-- be two migrations' destination at once, nor another migration's source).
+CREATE UNIQUE INDEX IF NOT EXISTS key_migrations_to_open_uq
+    ON key_migrations (to_key) WHERE status <> 'VOID';
+CREATE INDEX IF NOT EXISTS key_migrations_from_idx
+    ON key_migrations (from_key, id);
+CREATE INDEX IF NOT EXISTS key_migrations_to_idx
+    ON key_migrations (to_key, id) WHERE status <> 'VOID';
+CREATE TABLE IF NOT EXISTS key_migration_events (
+    id            BIGSERIAL PRIMARY KEY,
+    migration_id  BIGINT NOT NULL REFERENCES key_migrations(id),
+    from_key      TEXT NOT NULL,
+    to_key        TEXT NOT NULL,
+    event         TEXT NOT NULL CHECK (event IN
+                   ('MIGRATION_OPENED', 'START_WINDOW_CHANGED', 'MIGRATION_CUT',
+                    'MIGRATION_RECUT', 'MIGRATION_REOPENED', 'MIGRATION_VOIDED')),
+    window_start  BIGINT,
+    detail        JSONB,
+    operator      TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS key_migration_events_migration_idx
+    ON key_migration_events (migration_id, id);
+CREATE INDEX IF NOT EXISTS key_migration_events_from_idx
+    ON key_migration_events (from_key, id);
+-- Rejected upserts: after the cut the from_key is sealed — a late upsert must
+-- FAIL rather than silently route, but the event is durably recorded so the
+-- rejection is auditable ("切过去之后，迁出键再来新事件要失败"). Retractions
+-- keep flowing (they correct already-routed events and can reopen the cut).
+ALTER TABLE stream_events ADD COLUMN IF NOT EXISTS rejected BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE stream_events ADD COLUMN IF NOT EXISTS rejected_reason TEXT;
+ALTER TABLE stream_events ADD COLUMN IF NOT EXISTS migration_id BIGINT;
+CREATE INDEX IF NOT EXISTS stream_events_rejected_idx
+    ON stream_events (key, event_time) WHERE rejected;
+-- MIGRATION is a result reason like CARRY_FORWARD (to-key versions the routing
+-- produced), delivered downstream as CORRECTION (or NEW for a first release).
+ALTER TABLE results DROP CONSTRAINT IF EXISTS results_reason_check;
+ALTER TABLE results ADD CONSTRAINT results_reason_check
+    CHECK (reason IN ('INITIAL', 'LATE_EVENT', 'RETRACTION', 'CARRY_FORWARD',
+                      'MIGRATION'));
+ALTER TABLE audit DROP CONSTRAINT IF EXISTS audit_reason_check;
+ALTER TABLE audit ADD CONSTRAINT audit_reason_check
+    CHECK (reason IN ('INITIAL', 'LATE_EVENT', 'RETRACTION', 'CARRY_FORWARD',
+                      'MIGRATION'));
+-- Order folds driven by migration lifecycle events (a cut re-folds both keys;
+-- a void re-folds the from_key as its tail comes back).
+ALTER TABLE biz_order_versions DROP CONSTRAINT IF EXISTS biz_order_versions_reason_check;
+ALTER TABLE biz_order_versions ADD CONSTRAINT biz_order_versions_reason_check
+    CHECK (reason IN
+           ('ORDER_OPENED','WINDOW_JOINED','WINDOW_CORRECTED',
+            'WINDOW_WITHDRAWN','WINDOW_REVIVED','CARRY_RESOLVED',
+            'MIGRATION_CUT','MIGRATION_VOIDED'));
+-- CARRY_RESOLVED/MIGRATION folds may have no single triggering result row
+-- (e.g. a source-only void fold). Keep the FK column nullable for those.
+ALTER TABLE biz_order_versions ALTER COLUMN trigger_result_id DROP NOT NULL;
 """
 
 
@@ -838,16 +952,19 @@ def get_head_full(cur, window_start, key):
 
 
 def load_effective_events(cur, window_start, key):
-    """Effective (non-retracted) upserts of (window, key), per stream.
+    """Effective (non-retracted, non-rejected) upserts of (window, key), per
+    stream.
 
     Retractions are applied via NOT EXISTS over the whole stream, so a retract
-    event landing in a *different* window still filters its target.
+    event landing in a *different* window still filters its target. Upserts
+    rejected by a sealed (already-cut) migration are excluded everywhere — the
+    old key must never produce them, routed or own (see key_migrations).
     """
     window_end = window_start + WINDOW_MS
     cur.execute(
         """SELECT e.stream, e.event_id, e.event_time, e.payload
            FROM stream_events e
-           WHERE e.type = 'upsert' AND e.key = %s
+           WHERE e.type = 'upsert' AND e.key = %s AND NOT e.rejected
              AND e.event_time >= %s AND e.event_time < %s
              AND NOT EXISTS (
                  SELECT 1 FROM stream_events r
@@ -888,17 +1005,74 @@ def carries_for_window(cur, window_start, key):
     return list(carries.values())
 
 
-def render_window_payload(cur, window_start, key, carries=None):
+def migrations_for_window(cur, window_start, key):
+    """All active (non-VOID) migrations routing INTO (window, key), with their
+    currently-routed events that land in this window.
+
+    A migration routes from ``start_window_start`` on, so it contributes to
+    every to_key window at/after its start. Events whose origin window is the
+    queried one are attached (event_time bucketed by the ORIGIN event time, the
+    old key's window they belonged to). Events retracted at the from_key drop
+    out via the same effective-event filter own events use.
+    """
+    cur.execute(
+        """SELECT m.id, m.from_key, m.start_window_start, e.stream,
+                  e.event_id, e.event_time, e.payload
+           FROM key_migrations m
+           JOIN stream_events e
+             ON e.key = m.from_key AND e.type = 'upsert' AND NOT e.rejected
+                AND (e.event_time / %s) * %s = %s
+                AND e.event_time / %s * %s >= m.start_window_start
+                AND NOT EXISTS (
+                    SELECT 1 FROM stream_events r
+                    WHERE r.type = 'retract' AND r.stream = e.stream
+                      AND r.retracts = e.event_id)
+           WHERE m.to_key = %s AND m.status IN ('CUT', 'REOPENED')
+           ORDER BY m.id, e.stream, e.event_time, e.event_id""",
+        (WINDOW_MS, WINDOW_MS, window_start,
+         WINDOW_MS, WINDOW_MS, key),
+    )
+    groups = {}
+    for mid, from_key, start_ws, stream, event_id, event_time, payload in cur.fetchall():
+        g = groups.setdefault(mid, {"id": mid, "from_key": from_key,
+                                    "start_window_start": start_ws,
+                                    "by_side": {"a": [], "b": []}})
+        g["by_side"][stream].append(
+            {"event_id": event_id, "event_time": event_time, "payload": payload})
+    out = []
+    for mid in sorted(groups):
+        g = groups[mid]
+        for side in ("a", "b"):
+            if g["by_side"][side]:
+                out.append({"id": mid, "from_key": g["from_key"],
+                            "origin_window_start": window_start,
+                            "side": side, "events": g["by_side"][side]})
+    return out
+
+
+def render_window_payload(cur, window_start, key, carries=None, migrations=None,
+                          autoload=True):
     """The window's payload as it must be stored now: native events paired by
-    the ordinary rule, with live carries (if any) injected into their side and
-    every carry pair visibly tagged. ``carries`` is loaded by the caller when
-    needed; passing None/empty reproduces the pre-carry computation exactly."""
+    the ordinary rule, with active migrations routing whole-key-tail events in
+    (every such pair visibly tagged with its migration provenance) and live
+    carries routing same-key leftovers in. When ``autoload`` is True (the
+    default) the active migrations and carries aimed at this window are loaded
+    here; callers that already loaded them pass them in, and callers wanting a
+    deliberately plain render pass ``autoload=False``.
+    """
     window_end = window_start + WINDOW_MS
     by_stream = load_effective_events(cur, window_start, key)
-    if carries:
-        return compute_payload_with_carries(
+    if autoload:
+        if migrations is None:
+            migrations = migrations_for_window(cur, window_start, key)
+        if carries is None:
+            carries = carries_for_window(cur, window_start, key)
+    migrations = migrations or []
+    carries = carries or []
+    if migrations or carries:
+        return compute_payload_with_routes(
             key, window_start, window_end,
-            by_stream["a"], by_stream["b"], carries)
+            by_stream["a"], by_stream["b"], migrations, carries)
     return compute_payload(key, window_start, window_end,
                            by_stream["a"], by_stream["b"])
 
@@ -1004,11 +1178,10 @@ def emit(conn, window_start, key, reason, detail, grace=None):
                          window_start, key)
                 return False
 
-        payload = render_window_payload(
-            cur, window_start, key, carries_for_window(cur, window_start, key))
-        # Leftovers this window routed elsewhere stay visibly routed: they are
-        # not this window's own unmatched gap anymore. Applied AFTER the
-        # incoming-carries render so chained windows carry correctly.
+        payload = render_window_payload(cur, window_start, key)
+        # Leftovers this window routed elsewhere via a same-key gap carry stay
+        # visibly routed: they are not this window's own unmatched gap anymore.
+        # Applied AFTER the incoming-routes render so chained windows work.
         for oc in outgoing_carries_for_window(cur, window_start, key):
             payload = annotate_source_payload(
                 payload, oc["side"], oc["id"], oc["event_ids"])
@@ -1623,7 +1796,11 @@ def create_carry(conn, source_window_start, target_window_start, key, side,
                 404,
                 f"source window {source_window_start} of key {key!r} has no live result "
                 "to carry from")
-        native = render_window_payload(cur, source_window_start, key)
+        # Plain own-events recomputation: carry creation only routes THIS
+        # window's own leftovers, so routed-in carry/migration guests must not
+        # appear as its gap.
+        native = render_window_payload(cur, source_window_start, key,
+                                       autoload=False)
         leftovers = set(native.get(f"unmatched_{side}", []))
         if not leftovers:
             raise HTTPException(
@@ -1765,7 +1942,9 @@ def invalidate_dirty_carries(conn, dirty):
                 continue
             carry_ids = [r[0] for r in carry_rows]
             targets = {cid: r[1] for cid, r in zip(carry_ids, carry_rows)}
-            native = render_window_payload(cur, ws, key)
+            # Plain own-events recompute: a carried event's fate is judged
+            # against the source window's own pairing, never routed guests.
+            native = render_window_payload(cur, ws, key, autoload=False)
             by_stream = load_effective_events(cur, ws, key)
             for cid in carry_ids:
                 cur.execute(

@@ -595,11 +595,12 @@ def grace_fate(status, deadline_ms, now_ms, has_effective_data):
 ORDER_STATUSES = ("OPEN", "WAITING", "CLOSED", "REOPENED", "VOID")
 
 ORDER_REASONS = ("ORDER_OPENED", "WINDOW_JOINED", "WINDOW_CORRECTED",
-                 "WINDOW_WITHDRAWN", "WINDOW_REVIVED", "CARRY_RESOLVED")
+                 "WINDOW_WITHDRAWN", "WINDOW_REVIVED", "CARRY_RESOLVED",
+                 "MIGRATION_CUT", "MIGRATION_VOIDED")
 
 
 def evaluate_order(bindings, missing, pending, ever_closed, reason,
-                   open_carry_count=0):
+                   open_carry_count=0, open_migration_count=0):
     """Decide an order's status from its current window bindings.
 
     ``bindings``    — one dict per bound window: {"result_status", "has_gap"}.
@@ -612,20 +613,27 @@ def evaluate_order(bindings, missing, pending, ever_closed, reason,
                       moving events between this key's windows: the order is
                       not fully resolved while any exists ("结转还没对上" is
                       a waiting state, not a success), so CLOSE is blocked.
+    ``open_migration_count`` — non-terminal migrations OUT of this key that
+                      have not cut yet (OPEN; a REOPENED cut already routed its
+                      tail away and does not block): the key's order cannot
+                      reach CLOSED while its tail is held for a pending cut.
 
     CLOSE requires all of: at least one live window; every known business
     window bound (nothing missing or pending); no withdrawn window left
     unresolved; no live window still waiting for the opposite side; no
-    still-open carry. All windows withdrawn -> VOID (the business is gone, not
-    a success).
+    still-open carry; no OPEN outbound migration holding the key's tail. A CUT
+    migration removes the tail from this key entirely (its windows >= S are
+    excluded by the caller), so it neither blocks nor closes here. All windows
+    withdrawn -> VOID (the business is gone, not a success).
 
     A correction or withdrawal NEVER (re)closes an order that has been closed
     before: the close is invalidated and stays invalidated — the order shows
     REOPENED, never "still closed", no matter how well the data matches after
     the correction. Only genuine new business can close it again: a new
     window joining (WINDOW_JOINED), a withdrawn window reviving
-    (WINDOW_REVIVED) or a carry finally closing (CARRY_RESOLVED), evaluated
-    against the close conditions. Anything else short of CLOSE is OPEN while
+    (WINDOW_REVIVED), a carry finally closing (CARRY_RESOLVED), or an outbound
+    migration finally cutting / being voided (MIGRATION_CUT /
+    MIGRATION_VOIDED), evaluated against the close conditions. Anything else short of CLOSE is OPEN while
     windows are still being collected and WAITING once only one-sided gaps
     (or in-flight carries) remain — labelled REOPENED instead once the order
     has been closed before.
@@ -637,7 +645,8 @@ def evaluate_order(bindings, missing, pending, ever_closed, reason,
         return "REOPENED"
     if missing or pending or any(b["result_status"] == "RETRACTED" for b in bindings):
         return "REOPENED" if ever_closed else "OPEN"
-    if any(b["has_gap"] for b in live) or carry_open_block_order(open_carry_count):
+    if (any(b["has_gap"] for b in live) or carry_open_block_order(open_carry_count)
+            or migration_open_block_order(open_migration_count)):
         return "REOPENED" if ever_closed else "WAITING"
     return "CLOSED"
 
@@ -733,38 +742,111 @@ def annotate_source_payload(payload, side, carry_id, item_event_ids):
     return new_payload
 
 
-def compute_payload_with_carries(key, window_start, window_end,
-                                 a_upserts, b_upserts, carries):
-    """Compute a target window's result with live carry events routed in.
+# ---------------------------------------------------------------------------
+# Business-key migrations (业务键迁出).
+#
+# A migration routes the whole tail of one business key (from_key) to another
+# business key (to_key) from a start window S on: every from_key event with
+# event_time >= S that arrives BEFORE the cut stays stored under the from_key
+# but is suppressed from the from_key's own results and routed into the to_key
+# when the migration cuts; from_key upserts with event_time >= S arriving AFTER
+# the cut are rejected outright (the old key is closed for business). Windows
+# strictly before S that already produced results keep them — "之前已经出过的
+# 结果还挂在迁出键上，不能改挂过去".
+#
+# Lifecycle (the migration row is append-only audit + mutable head state):
+#   OPEN     declared, not cut yet: the start window may still be moved; the
+#            from_key's windows >= S are held (no own result);
+#   CUT      the start window became due: the held events route into the to_key
+#            from S on, the cut snapshot records the two sides' versions at
+#            that moment, the from_key is sealed (later upserts fail);
+#   REOPENED a later correction/retraction at either side of the start window
+#            invalidated the cut: it must never keep showing CUT. The routed
+#            events keep routing (to-key results stay correct); once the
+#            start window settles it re-CUTs (new snapshot) or, when every
+#            routed event was retracted at the source, auto-VOIDs;
+#   VOID     terminal. Only possible while uncut (OPEN), or when a reopened
+#            cut collapses (all routed events retracted). The from_key emits
+#            its own windows again, and the same migration row can never cut.
+#
+# Routed events are visibly MIGRATED, never native to the to_key: every pair
+# they join carries {"migration_id", "from_key", "origin_window_start"}, and
+# unpaired routed events live in unmatched_migrated_a/b (never silently merged
+# into the to_key's own unmatched lists). Native pairing always happens first;
+# a routed event can never displace a native pair.
+# ---------------------------------------------------------------------------
 
-    ``carries`` is a list of {"id", "side", "source_window_start", "events":
-    [{"event_id", "event_time", "payload"}]} for every non-VOID carry aimed at
-    this window (VOID carries are excluded by the caller).
+MIGRATION_STATUSES = ("OPEN", "CUT", "REOPENED", "VOID")
+# Why a migration died. source_retracted = every routed event was retracted at
+# the from_key before/after the cut (uncut migrations may also be voided
+# manually -> operator_void).
+MIGRATION_VOID_REASONS = ("operator_void", "source_retracted")
 
-    Two pairing pools, in strict order:
 
-    1. NATIVE pairing - the target window's own events pair exactly as in
-       compute_payload (sorted by (event_time, event_id), positionally). A
-       routed-in event can NEVER displace one of these pairs, no matter where
-       its event_time sorts: the carry was routed to fill the target's gap, not
-       to rearrange the target's own business.
-    2. CARRY pairing - each carried event then pairs against the target's own
-       leftover on the opposite side (the gap this carry was opened for). Two
-       carried events never pair each other (routed leftovers from two windows
-       closing against each other would prove nothing about the target). When
-       several carries compete for one leftover, the OLDEST carry wins
-       (carry id, then event_time, event_id) - deterministic FIFO.
+def migration_create_error(from_window_emitted, to_window_emitted,
+                           from_active, to_active, same_key):
+    """Machine-readable precondition failure for declaring / moving a migration.
 
-    Every carry pair is tagged {"carry_id", "source_window_start"}, so the
-    result can never present a carry match as the target window's own native
-    pair. Unpaired carried events stay OUT of unmatched_* (they are not the
-    target's events - they remain CARRIED on their carry, which is how a
-    partially matched carry stays OPEN); the target's own leftovers it did not
-    pair stay in unmatched_* and may themselves be carried onward later.
+    Returns None when the declaration is valid, otherwise:
+
+    - ``same_key``             — from_key and to_key must differ;
+    - ``from_window_emitted``  — the from_key already produced a result at S or
+                                 later ("这一窗起新事件不能再出自己的结果" — a key
+                                 that is already emitting its own tail cannot
+                                 be migrated from there);
+    - ``to_window_emitted``    — the to_key already produced a result at S
+                                 ("迁入键自己已经出过的窗口不能当起始窗");
+    - ``from_key_busy``/``to_key_busy`` — the key is already a side of an
+                                 unfinished (non-VOID) migration ("同一迁出键不
+                                 能同时开着两笔"; a key entangled in one open
+                                 migration cannot be re-aimed mid-flight).
+    """
+    if same_key:
+        return "same_key"
+    if from_window_emitted:
+        return "from_window_emitted"
+    if to_window_emitted:
+        return "to_window_emitted"
+    if from_active:
+        return "from_key_busy"
+    if to_active:
+        return "to_key_busy"
+    return None
+
+
+def compute_payload_with_routes(key, window_start, window_end,
+                                a_upserts, b_upserts, migrations, carries=()):
+    """Compute a window's result with routed-in events.
+
+    Two routing mechanisms, both "guest events in someone else's window":
+
+    - ``migrations``: list of {"id", "from_key", "origin_window_start",
+      "side", "events"} — a whole key tail migrating in. Migrated events may
+      pair the to_key's own leftovers AND each other (both sides of the OLD
+      key's business arrive together), so a migrated-A/migrated-B pair is a
+      legitimate pair and carries both migrations' provenance;
+    - ``carries``: list of {"id", "source_window_start", "side", "events"} —
+      same-key leftover carries, whose events never pair each other.
+
+    Pairing pools, in strict order:
+
+    1. NATIVE — the window's own events pair exactly as compute_payload;
+    2. MIGRATION — migrated events first take native leftovers (older migration
+       first, FIFO), then pair each other across the two sides;
+    3. CARRY — gap-carry events take whatever native leftovers remain (they
+       never pair each other or migrated events).
+
+    Every non-native pair is tagged with its provenance. Unpaired migrated
+    events stay OUT of unmatched_* — they are not the to_key's own leftovers;
+    they appear in unmatched_migrated_* (keyed per migration), which is also
+    how a to_key result visibly "带了迁出键过来的事件" when no native opposite
+    exists yet. Returns None only when there is no native and no routed input.
     """
     a_native = sorted(a_upserts, key=lambda e: (e["event_time"], e["event_id"]))
     b_native = sorted(b_upserts, key=lambda e: (e["event_time"], e["event_id"]))
-    if not a_native and not b_native and not carries:
+    migrations = list(migrations or [])
+    carries = list(carries or [])
+    if not a_native and not b_native and not migrations and not carries:
         return None
 
     # 1) native pairing pool (unchanged from compute_payload)
@@ -776,48 +858,158 @@ def compute_payload_with_carries(key, window_start, window_end,
             "a_payload": a_native[i].get("payload"),
             "b_payload": b_native[i].get("payload"),
             "carry": None,
+            "migration": None,
         }
         for i in range(n)
     ]
-    a_left = list(a_native[n:])   # target's own A leftovers
-    b_left = list(b_native[n:])   # target's own B leftovers
+    a_left = list(a_native[n:])
+    b_left = list(b_native[n:])
 
-    # 2) carry pairing pool - only against the target's own opposite leftovers.
-    queued = {"a": [], "b": []}
-    for c in sorted(carries, key=lambda c: c["id"]):
-        tag = {"carry_id": c["id"], "source_window_start": c["source_window_start"]}
-        for e in sorted(c["events"], key=lambda e: (e["event_time"], e["event_id"])):
-            queued[c["side"]].append((e, tag))
-    queued["a"].sort(key=lambda t: (t[1]["carry_id"], t[0]["event_time"], t[0]["event_id"]))
-    queued["b"].sort(key=lambda t: (t[1]["carry_id"], t[0]["event_time"], t[0]["event_id"]))
+    def mtag(m):
+        return {"migration_id": m["id"], "from_key": m["from_key"],
+                "origin_window_start": m["origin_window_start"]}
 
-    carry_pairs = []
-    for ea, tag in queued["a"]:
+    # 2a) migrated events queue per side, ordered oldest-migration-first so the
+    # FIFO winner is deterministic; (time, event_id) breaks ties inside one.
+    mqueued = {"a": [], "b": []}
+    for m in sorted(migrations, key=lambda m: m["id"]):
+        for e in sorted(m["events"], key=lambda e: (e["event_time"], e["event_id"])):
+            mqueued[m["side"]].append((e, m))
+    mqueued["a"].sort(key=lambda t: (t[1]["id"], t[0]["event_time"], t[0]["event_id"]))
+    mqueued["b"].sort(key=lambda t: (t[1]["id"], t[0]["event_time"], t[0]["event_id"]))
+
+    migrated_pairs = []
+    m_a_left, m_b_left = [], []
+    for ea, ma in mqueued["a"]:
         if b_left:
-            eb = b_left.pop(0)  # native leftovers are already (time,id)-sorted
-            carry_pairs.append((ea, eb, tag))
-    for eb, tag in queued["b"]:
+            eb = b_left.pop(0)
+            migrated_pairs.append((ea, eb, mtag(ma), None))
+        else:
+            m_a_left.append((ea, ma))
+    for eb, mb in mqueued["b"]:
         if a_left:
             ea = a_left.pop(0)
-            carry_pairs.append((ea, eb, tag))
+            migrated_pairs.append((ea, eb, mtag(mb), None))
+        else:
+            m_b_left.append((eb, mb))
+    # 2b) migrated leftovers pair EACH OTHER across the old key's two sides
+    # (both migrated; the pair carries both migrations' provenance).
+    for (ea, ma), (eb, mb) in zip(m_a_left, m_b_left):
+        migrated_pairs.append((ea, eb, mtag(ma), mtag(mb)))
+    m_a_unpaired = m_a_left[len(m_b_left):] if len(m_a_left) > len(m_b_left) else []
+    m_b_unpaired = m_b_left[len(m_a_left):] if len(m_b_left) > len(m_a_left) else []
 
+    for ea, eb, ta, tb in migrated_pairs:
+        pairs.append({
+            "a_event_id": ea["event_id"], "b_event_id": eb["event_id"],
+            "a_payload": ea.get("payload"), "b_payload": eb.get("payload"),
+            "migration": {"a": ta, "b": tb}, "carry": None,
+        })
+
+    # 3) carry pairing pool — against whatever native leftovers survive, and
+    # only those (carries never pair migrated events or each other).
+    cqueued = {"a": [], "b": []}
+    for c in sorted(carries, key=lambda c: c["id"]):
+        ctag = {"carry_id": c["id"], "source_window_start": c["source_window_start"]}
+        for e in sorted(c["events"], key=lambda e: (e["event_time"], e["event_id"])):
+            cqueued[c["side"]].append((e, ctag))
+    cqueued["a"].sort(key=lambda t: (t[1]["carry_id"], t[0]["event_time"], t[0]["event_id"]))
+    cqueued["b"].sort(key=lambda t: (t[1]["carry_id"], t[0]["event_time"], t[0]["event_id"]))
+    carry_pairs = []
+    for ea, tag in cqueued["a"]:
+        if b_left:
+            carry_pairs.append((ea, b_left.pop(0), tag))
+    for eb, tag in cqueued["b"]:
+        if a_left:
+            carry_pairs.append((a_left.pop(0), eb, tag))
     for ea, eb, tag in carry_pairs:
         pairs.append({
             "a_event_id": ea["event_id"], "b_event_id": eb["event_id"],
             "a_payload": ea.get("payload"), "b_payload": eb.get("payload"),
-            "carry": tag,
+            "carry": tag, "migration": None,
         })
+
+    # Unpaired migrated events per (migration, side): a separate ledger from
+    # the to_key's own unmatched_* — the result still visibly carries them.
+    unmatched_migrated = {}
+    for e, m in m_a_unpaired:
+        bucket = unmatched_migrated.setdefault(
+            m["id"], {"migration_id": m["id"], "from_key": m["from_key"],
+                      "origin_window_start": m["origin_window_start"],
+                      "a": [], "b": []})
+        bucket["a"].append(e["event_id"])
+    for e, m in m_b_unpaired:
+        bucket = unmatched_migrated.setdefault(
+            m["id"], {"migration_id": m["id"], "from_key": m["from_key"],
+                      "origin_window_start": m["origin_window_start"],
+                      "a": [], "b": []})
+        bucket["b"].append(e["event_id"])
+    for bucket in unmatched_migrated.values():
+        bucket["a"].sort()
+        bucket["b"].sort()
+
     return {
         "key": key,
         "window_start": window_start,
         "window_end": window_end,
-        "match_count": len(pairs) - len(carry_pairs),
+        "match_count": n,
+        "migration_match_count": len(migrated_pairs),
         "carry_match_count": len(carry_pairs),
         "pairs": pairs,
         "unmatched_a": [e["event_id"] for e in a_left],
         "unmatched_b": [e["event_id"] for e in b_left],
+        "unmatched_migrated": [unmatched_migrated[k]
+                               for k in sorted(unmatched_migrated)],
         "carried": {},
     }
+
+
+def migration_pair_migration_ids(pair):
+    """The migration ids whose routed events a result pair involves (a pair can
+    join migrated events from both sides). Native pairs give an empty set."""
+    tag = pair.get("migration")
+    if not tag:
+        return set()
+    return {t["migration_id"] for t in (tag.get("a"), tag.get("b")) if t}
+
+
+def migration_matched_event_ids(payload, migration_id):
+    """The set of THIS migration's events the to_key payload currently pairs.
+    Recomputed on every derivation, so a cut whose routed pair disappears is
+    reopened automatically ("已经切过去的必须重开，不能还显示切成功了")."""
+    if payload is None:
+        return set()
+    ids = set()
+    for p in payload.get("pairs", []):
+        if migration_id in migration_pair_migration_ids(p):
+            for side in ("a", "b"):
+                tag = (p.get("migration") or {}).get(side)
+                if tag and tag.get("migration_id") == migration_id:
+                    ids.add(p[f"{side}_event_id"])
+    return ids
+
+
+def migration_unpaired_event_ids(payload, migration_id):
+    """This migration's routed events currently shown as unmatched_migrated."""
+    if payload is None:
+        return set()
+    ids = set()
+    for u in payload.get("unmatched_migrated", []):
+        if u.get("migration_id") == migration_id:
+            ids.update(u.get("a", []))
+            ids.update(u.get("b", []))
+    return ids
+
+
+def compute_payload_with_carries(key, window_start, window_end,
+                                 a_upserts, b_upserts, carries):
+    """Compute a target window's result with live carry events routed in.
+
+    Thin wrapper over :func:`compute_payload_with_routes` — a gap carry is one
+    kind of routed-in event. See that function for the pairing-pool semantics.
+    """
+    return compute_payload_with_routes(
+        key, window_start, window_end, a_upserts, b_upserts, [], carries)
 
 
 def carry_matched_event_ids(payload, carry_id):
